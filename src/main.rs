@@ -3,7 +3,6 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, error};
-use tokio_util::sync::CancellationToken;
 
 mod serial_client;
 mod alpaca_server;
@@ -116,16 +115,15 @@ async fn main() -> Result<()> {
     
     // Start serial communication if port was selected
     let serial_handle = if let Some(port) = serial_port {
-        let cancellation_token = CancellationToken::new();  // Move this line here
+        // Don't create cancellation token here - let the web interface manage it
         Some(tokio::spawn(serial_client::run_serial_client(
             port,
             args.baud,
             device_state.clone(),
-            cancellation_token,
         )))
     } else {
         None
-    };  
+    };
     
     info!("Bridge running at http://{}:{}", args.bind, args.http_port);
     info!("Web interface: http://{}:{}/", args.bind, args.http_port);
