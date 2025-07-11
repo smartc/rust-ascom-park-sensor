@@ -12,13 +12,20 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn};
+use tracing::info;
 
-// Global to track the current serial connection task
+// Global to track the current serial connection task and cancellation
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use tokio_util::sync::CancellationToken;
 
 static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+static SERIAL_CANCELLATION: OnceLock<Mutex<Option<CancellationToken>>> = OnceLock::new();
+
+// Helper function to get the cancellation token
+pub fn get_serial_cancellation() -> &'static Mutex<Option<CancellationToken>> {
+    SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None))
+}
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
@@ -191,9 +198,13 @@ async fn api_connect(
     let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
     if let Ok(mut current_task) = task_mutex.lock() {
         if let Some(task) = current_task.take() {
+            info!("Aborting existing serial task");
             task.abort();
         }
     }
+    
+    // Wait a moment for cleanup
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Start a new serial connection task
     let device_state_clone = state.clone();
@@ -226,17 +237,22 @@ async fn api_connect(
 async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
     info!("Disconnecting from nRF52840 device");
     
-    // Abort the current serial task and wait for it to complete
+    // Abort the task - this should stop all async operations immediately
     let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
     if let Ok(mut current_task) = task_mutex.lock() {
         if let Some(task) = current_task.take() {
+            info!("Aborting serial task");
             task.abort();
-            // Give it a moment to clean up
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            
+            // Wait for the task to actually stop
+            match tokio::time::timeout(Duration::from_millis(1000), task).await {
+                Ok(_) => info!("Serial task stopped cleanly"),
+                Err(_) => info!("Serial task abort timed out (this is normal)"),
+            }
         }
     }
     
-    // Update device state to disconnected
+    // Force update device state to disconnected
     {
         let mut device_state = state.write().await;
         device_state.connected = false;
@@ -244,8 +260,7 @@ async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectRespons
         device_state.clear_error();
     }
     
-    // Wait a bit more to ensure port is released
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    info!("Device marked as disconnected");
     
     Json(ConnectResponse {
         success: true,

@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, timeout};
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, error, info, warn};
+use tokio_util::sync::CancellationToken;
 
 pub async fn run_serial_client(
     port_name: String,
@@ -21,29 +22,18 @@ pub async fn run_serial_client(
         state.serial_port = Some(port_name.clone());
     }
 
-    loop {
-        match connect_and_monitor(&port_name, baud_rate, device_state.clone()).await {
-            Ok(()) => {
-                info!("Serial connection ended normally");
-                break;
-            }
-            Err(e) => {
-                error!("Serial connection error: {}", e);
-                
-                // Update device state with error
-                {
-                    let mut state = device_state.write().await;
-                    state.set_error(&format!("Serial error: {}", e));
-                }
-                
-                // Wait before retrying
-                warn!("Retrying connection in 5 seconds...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
+    let result = connect_and_monitor(&port_name, baud_rate, device_state.clone()).await;
+    
+    // Always mark as disconnected when we exit for any reason
+    {
+        let mut state = device_state.write().await;
+        state.connected = false;
+        state.serial_port = None;
+        state.clear_error();
     }
     
-    Ok(())
+    info!("Serial client stopped");
+    result
 }
 
 async fn connect_and_monitor(
@@ -54,7 +44,7 @@ async fn connect_and_monitor(
     info!("Connecting to nRF52840 at {} at {} baud", port_name, baud_rate);
     
     // Open serial port with settings appropriate for nRF52840
-    let port = tokio_serial::new(port_name, baud_rate)
+    let mut port = tokio_serial::new(port_name, baud_rate)
         .timeout(Duration::from_millis(1000))
         .data_bits(tokio_serial::DataBits::Eight)
         .flow_control(tokio_serial::FlowControl::None)
@@ -62,11 +52,53 @@ async fn connect_and_monitor(
         .stop_bits(tokio_serial::StopBits::One)
         .open_native_async()?;
     
+    // CRITICAL: Set DTR/RTS control signals like Arduino Serial Monitor
+    #[cfg(windows)]
+    {
+        use tokio_serial::SerialPort;
+        if let Err(e) = port.write_data_terminal_ready(true) {
+            warn!("Failed to set DTR: {}", e);
+        } else {
+            debug!("DTR set to true");
+        }
+        if let Err(e) = port.write_request_to_send(false) {
+            warn!("Failed to set RTS: {}", e);
+        } else {
+            debug!("RTS set to false");
+        }
+    }
+    
+    // Wait for device to respond to DTR/RTS and send startup messages
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    
     // Set up buffered reader/writer
     let (reader, mut writer) = tokio::io::split(port);
     let mut reader = BufReader::new(reader);
     
     info!("Serial connection established to nRF52840 device");
+    
+    // Read and log startup messages (but don't process them as commands)
+    info!("Reading device startup messages...");
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < Duration::from_secs(3) {
+        let mut line = String::new();
+        
+        match tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut line)).await {
+            Ok(Ok(bytes_read)) => {
+                if bytes_read > 0 {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        debug!("Device startup: {}", trimmed);
+                        if trimmed.contains("Device ready") {
+                            info!("nRF52840 device reports ready");
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
     
     // Mark as connected and clear any errors
     {
@@ -75,19 +107,15 @@ async fn connect_and_monitor(
         state.clear_error();
     }
     
-    // Wait a moment for device to be ready
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
     // Set up periodic polling intervals
     let mut status_interval = interval(Duration::from_secs(10)); // Device status every 10s
     let mut position_interval = interval(Duration::from_secs(3)); // Position/park status every 3s
     
-    // Initial device inquiry - wait a bit more for device to be ready
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Initial device inquiry - device should be ready now
     info!("Sending initial status query to nRF52840");
     send_command(&mut writer, "01").await?;  // Get device status
     
-    loop {
+    let connection_result = loop {
         tokio::select! {
             // Handle incoming data
             result = read_response(&mut reader) => {
@@ -103,7 +131,7 @@ async fn connect_and_monitor(
                     }
                     Err(e) => {
                         error!("Error reading from serial: {}", e);
-                        return Err(e);
+                        break Err(e);
                     }
                 }
             }
@@ -113,7 +141,7 @@ async fn connect_and_monitor(
                 debug!("Polling device status");
                 if let Err(e) = send_command(&mut writer, "01").await {  // CMD_GET_STATUS
                     error!("Error sending status check: {}", e);
-                    return Err(e);
+                    break Err(e);
                 }
             }
             
@@ -122,11 +150,31 @@ async fn connect_and_monitor(
                 debug!("Polling park status");
                 if let Err(e) = send_command(&mut writer, "03").await {  // CMD_IS_PARKED
                     error!("Error sending park status check: {}", e);
-                    return Err(e);
+                    break Err(e);
                 }
             }
         }
+    };
+    
+    // IMPORTANT: Explicitly close the serial port before exiting
+    info!("Closing serial port resources...");
+    
+    // Drop reader/writer to close port
+    drop(reader);
+    drop(writer);
+    
+    // Small delay to ensure OS releases the port
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    // Mark as disconnected when exiting
+    {
+        let mut state = device_state.write().await;
+        state.connected = false;
+        state.clear_error();
     }
+    
+    info!("Serial port released and connection monitor stopped");
+    connection_result
 }
 
 async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStream>, command: &str) -> Result<()> {
@@ -269,8 +317,8 @@ async fn update_device_state_from_data(
 
 // Public function to send commands from web interface
 pub async fn send_device_command(
-    device_state: Arc<RwLock<DeviceState>>,
-    command: &str,
+    _device_state: Arc<RwLock<DeviceState>>,
+    _command: &str,
 ) -> Result<String> {
     // This function would need access to the writer, which we'd need to refactor
     // For now, return an error indicating this needs implementation

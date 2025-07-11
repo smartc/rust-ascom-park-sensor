@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
     
     // Start serial communication if port was selected
     let serial_handle = if let Some(port) = serial_port {
+        // Don't create cancellation token here - let the web interface manage it
         Some(tokio::spawn(serial_client::run_serial_client(
             port,
             args.baud,

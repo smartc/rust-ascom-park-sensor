@@ -9,9 +9,7 @@ authors = ["Corey Smart"]
 name = "telescope_park_bridge"
 path = "src/main.rs"
 
-[[bin]]
-name = "test_device"
-path = "src/bin/test_device.rs"
+# Remove test_device binary since it's in src/bin/
 
 [dependencies]
 # Serial communication
@@ -21,6 +19,7 @@ tokio-serial = "5.4"
 # HTTP server for web interface and ASCOM Alpaca API
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 
