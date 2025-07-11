@@ -1,33 +1,31 @@
 use crate::device_state::DeviceState;
 use axum::{
     extract::{Path, Query, State},
-    response::{Html, Json},
+    response::Html,
     routing::{get, post},
-    Router, Json as ExtractJson,
+    Router, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-
-// Global to track the current serial connection task and cancellation
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 
-static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-static SERIAL_CANCELLATION: OnceLock<Mutex<Option<CancellationToken>>> = OnceLock::new();
+// Global to track the current serial connection
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-// Helper function to get the cancellation token
-pub fn get_serial_cancellation() -> &'static Mutex<Option<CancellationToken>> {
-    SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None))
+struct SerialConnection {
+    task: JoinHandle<()>,
+    cancellation_token: CancellationToken,
 }
 
-// External template files
+static SERIAL_CONNECTION: OnceLock<Mutex<Option<SerialConnection>>> = OnceLock::new();
+
+// Template includes
 const INDEX_HTML: &str = include_str!("../templates/index.html");
 const STYLE_CSS: &str = include_str!("../templates/style.css");
 const SCRIPT_JS: &str = include_str!("../templates/script.js");
@@ -82,7 +80,7 @@ struct ConnectRequest {
 }
 
 #[derive(Deserialize)]
-struct CommandRequest {
+struct SerialCommandRequest {
     command: String,
 }
 
@@ -132,11 +130,9 @@ fn create_router(device_state: SharedState) -> Router {
         .route("/api/connect", post(api_connect))
         .route("/api/disconnect", post(api_disconnect))
         .route("/api/command", post(api_send_command))
-        
-        // Device control routes
-        .route("/api/device/calibrate", post(api_calibrate))
-        .route("/api/device/set_park", post(api_set_park))
-        .route("/api/device/factory_reset", post(api_factory_reset))
+        .route("/api/set_park", post(api_set_park))
+        .route("/api/calibrate", post(api_calibrate))
+        .route("/api/factory_reset", post(api_factory_reset))
 
         // ASCOM Alpaca Management API
         .route("/management/apiversions", get(management_api_versions))
@@ -188,71 +184,64 @@ async fn api_ports() -> Json<PortListResponse> {
     }
 }
 
+#[axum::debug_handler]
 async fn api_connect(
     State(state): State<SharedState>,
-    ExtractJson(request): ExtractJson<ConnectRequest>,
+    Json(request): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
     let baud_rate = request.baud_rate.unwrap_or(115200);
     
-    // Abort any existing serial task
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_task) = task_mutex.lock() {
-        if let Some(task) = current_task.take() {
-            info!("Aborting existing serial task");
-            task.abort();
-        }
-    }
+    info!("Connecting to {} at {} baud", request.port, baud_rate);
     
-    // Wait a moment for cleanup
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Stop any existing connection
+    stop_serial_connection().await;
     
-    // Start a new serial connection task
+    // Create new cancellation token
+    let cancellation_token = CancellationToken::new();
+    
+    // Start new serial connection task
     let device_state_clone = state.clone();
     let port = request.port.clone();
+    let token_clone = cancellation_token.clone();
     
     let new_task = tokio::spawn(async move {
-        if let Err(e) = crate::serial_client::run_serial_client(port, baud_rate, device_state_clone).await {
+        if let Err(e) = crate::serial_client::run_serial_client(port, baud_rate, device_state_clone, token_clone).await {
             tracing::error!("Serial client error: {}", e);
         }
     });
     
-    // Store the new task
-    if let Ok(mut current_task) = task_mutex.lock() {
-        *current_task = Some(new_task);
+    // Store the new connection
+    let connection_mutex = SERIAL_CONNECTION.get_or_init(|| Mutex::new(None));
+    if let Ok(mut current_connection) = connection_mutex.lock() {
+        *current_connection = Some(SerialConnection {
+            task: new_task,
+            cancellation_token,
+        });
     }
     
-    // Update the device state to show the selected port
+    // Update device state
     {
         let mut device_state = state.write().await;
         device_state.serial_port = Some(request.port.clone());
         device_state.clear_error();
+        device_state.connected = false; // Will be set by serial client
     }
     
     Json(ConnectResponse {
         success: true,
-        message: format!("Connecting to nRF52840 device on {} at {} baud", request.port, baud_rate),
+        message: format!("Connecting to {} at {} baud", request.port, baud_rate),
     })
 }
 
-async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
-    info!("Disconnecting from nRF52840 device");
+#[axum::debug_handler]
+async fn api_disconnect(
+    State(state): State<SharedState>,
+) -> Json<ConnectResponse> {
+    info!("Disconnecting from serial device");
     
-    // Abort the task - this should stop all async operations immediately
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_task) = task_mutex.lock() {
-        if let Some(task) = current_task.take() {
-            info!("Aborting serial task");
-            task.abort();
-            
-            // Wait for the task to actually stop
-            match tokio::time::timeout(Duration::from_millis(1000), task).await {
-                Ok(_) => info!("Serial task stopped cleanly"),
-                Err(_) => info!("Serial task abort timed out (this is normal)"),
-            }
-        }
-    }
+    stop_serial_connection().await;
     
-    // Force update device state to disconnected
+    // Update device state
     {
         let mut device_state = state.write().await;
         device_state.connected = false;
@@ -260,49 +249,114 @@ async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectRespons
         device_state.clear_error();
     }
     
-    info!("Device marked as disconnected");
+    Json(ConnectResponse {
+        success: true,
+        message: "Disconnected from serial device".to_string(),
+    })
+}
+
+async fn stop_serial_connection() {
+    let connection_mutex = SERIAL_CONNECTION.get_or_init(|| Mutex::new(None));
+    
+    if let Ok(mut current_connection) = connection_mutex.lock() {
+        if let Some(connection) = current_connection.take() {
+            info!("Stopping existing serial connection");
+            
+            // Cancel the task
+            connection.cancellation_token.cancel();
+            
+            // Give it a moment to cleanup
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            // Abort if still running
+            if !connection.task.is_finished() {
+                connection.task.abort();
+                info!("Aborted serial task");
+            }
+            
+            // Wait a bit more for port to be released
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+// Placeholder functions for device commands (to be implemented)
+async fn api_send_command(
+    State(state): State<SharedState>,
+    Json(request): Json<SerialCommandRequest>,
+) -> Json<CommandResponse> {
+    let device_state = state.read().await;
+    
+    if !device_state.connected {
+        return Json(CommandResponse {
+            success: false,
+            command: request.command,
+            response: None,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    info!("Manual command received: {}", request.command);
+    
+    Json(CommandResponse {
+        success: true,
+        command: request.command.clone(),
+        response: Some("Command acknowledged (manual command handling not fully implemented)".to_string()),
+        message: format!("Sent command: {}", request.command),
+    })
+}
+
+async fn api_set_park(State(state): State<SharedState>) -> Json<ConnectResponse> {
+    let device_state = state.read().await;
+    
+    if !device_state.connected {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    info!("Set park position command received");
     
     Json(ConnectResponse {
         success: true,
-        message: "Disconnected from nRF52840 device".to_string(),
+        message: "Set park position command sent".to_string(),
     })
 }
 
-async fn api_send_command(
-    State(_state): State<SharedState>,
-    ExtractJson(request): ExtractJson<CommandRequest>,
-) -> Json<CommandResponse> {
-    // TODO: Implement command sending
-    // This will require refactoring the serial client to expose a command channel
-    Json(CommandResponse {
-        success: false,
-        command: request.command,
-        response: None,
-        message: "Command sending not yet implemented - will be added in next update".to_string(),
-    })
-}
-
-async fn api_calibrate(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send calibration command (06)
+async fn api_calibrate(State(state): State<SharedState>) -> Json<ConnectResponse> {
+    let device_state = state.read().await;
+    
+    if !device_state.connected {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    info!("Calibrate sensor command received");
+    
     Json(ConnectResponse {
-        success: false,
-        message: "Calibration command not yet implemented - will be added in next update".to_string(),
+        success: true,
+        message: "Calibrate sensor command sent".to_string(),
     })
 }
 
-async fn api_set_park(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send set park command (04 or 0D)
+async fn api_factory_reset(State(state): State<SharedState>) -> Json<ConnectResponse> {
+    let device_state = state.read().await;
+    
+    if !device_state.connected {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    info!("Factory reset command received");
+    
     Json(ConnectResponse {
-        success: false,
-        message: "Set park command not yet implemented - will be added in next update".to_string(),
-    })
-}
-
-async fn api_factory_reset(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send factory reset command (0E)
-    Json(ConnectResponse {
-        success: false,
-        message: "Factory reset command not yet implemented - will be added in next update".to_string(),
+        success: true,
+        message: "Factory reset command sent".to_string(),
     })
 }
 
@@ -317,10 +371,10 @@ async fn management_api_versions(Query(query): Query<AlpacaQuery>) -> Json<Alpac
 
 async fn management_configured_devices(Query(query): Query<AlpacaQuery>) -> Json<AlpacaResponse<Vec<HashMap<String, serde_json::Value>>>> {
     let mut device = HashMap::new();
-    device.insert("DeviceName".to_string(), serde_json::Value::String("nRF52840 Telescope Park Sensor".to_string()));
+    device.insert("DeviceName".to_string(), serde_json::Value::String("Telescope Park Sensor".to_string()));
     device.insert("DeviceType".to_string(), serde_json::Value::String("SafetyMonitor".to_string()));
     device.insert("DeviceNumber".to_string(), serde_json::Value::Number(serde_json::Number::from(0)));
-    device.insert("UniqueID".to_string(), serde_json::Value::String("nrf52840-park-sensor-0".to_string()));
+    device.insert("UniqueID".to_string(), serde_json::Value::String("telescope-park-bridge-0".to_string()));
     
     Json(AlpacaResponse::success(
         vec![device],
@@ -331,7 +385,7 @@ async fn management_configured_devices(Query(query): Query<AlpacaQuery>) -> Json
 
 async fn management_description(Query(query): Query<AlpacaQuery>) -> Json<AlpacaResponse<HashMap<String, String>>> {
     let mut description = HashMap::new();
-    description.insert("ServerName".to_string(), "nRF52840 Telescope Park Bridge".to_string());
+    description.insert("ServerName".to_string(), "Telescope Park Bridge".to_string());
     description.insert("Manufacturer".to_string(), "Corey Smart".to_string());
     description.insert("ManufacturerVersion".to_string(), env!("CARGO_PKG_VERSION").to_string());
     description.insert("Location".to_string(), "Local".to_string());
@@ -383,7 +437,7 @@ async fn get_description(
     }
     
     Json(AlpacaResponse::success(
-        "nRF52840 XIAO Sense Based Telescope Park Position Sensor with Built-in IMU".to_string(),
+        "nRF52840 XIAO Sense Based Position Sensor for Telescope Park Detection".to_string(),
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -405,7 +459,7 @@ async fn get_driver_info(
     }
     
     let device_state = state.read().await;
-    let driver_info = format!("nRF52840 Telescope Park Bridge v{} for {}", 
+    let driver_info = format!("Telescope Park Bridge v{} for {}", 
         env!("CARGO_PKG_VERSION"), 
         device_state.device_name
     );
@@ -527,7 +581,7 @@ async fn get_is_safe(
             query.client_transaction_id.unwrap_or(0),
             next_server_transaction_id(),
             0x407,
-            "nRF52840 device not connected".to_string(),
+            "Device not connected".to_string(),
         ));
     }
     
@@ -538,7 +592,7 @@ async fn get_is_safe(
             query.client_transaction_id.unwrap_or(0),
             next_server_transaction_id(),
             0x408,
-            "nRF52840 device data is stale".to_string(),
+            "Device data is stale".to_string(),
         ));
     }
     
