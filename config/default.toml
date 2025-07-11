@@ -1,0 +1,14 @@
+[serial]
+port = "COM9"  # Adjust for your ESP32's port
+baud_rate = 115200
+timeout_ms = 5000
+
+[alpaca]
+bind_address = "127.0.0.1"
+port = 11111
+device_number = 0
+
+[device]
+name = "Telescope Park Sensor"
+description = "ESP32 Based Custom Position Sensor"
+manufacturer = "Corey Smart"
