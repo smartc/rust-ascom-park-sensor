@@ -1,6 +1,6 @@
 [package]
 name = "telescope_park_bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -8,8 +8,9 @@ edition = "2021"
 serialport = "4.3"
 tokio-serial = "5.4"
 
+
 # HTTP server for ASCOM Alpaca API
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1.0", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
@@ -31,3 +32,8 @@ thiserror = "1.0"
 
 # Utilities
 uuid = { version = "1.0", features = ["v4"] }
+include_dir = "0.7"
+
+# HTTP client for ASCOM telescope communication
+reqwest = { version = "0.11", features = ["json"] }
+url = "2.4"

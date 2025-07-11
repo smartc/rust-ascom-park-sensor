@@ -1,4 +1,5 @@
 use crate::device_state::DeviceState;
+use crate::telescope_client::TelescopeClient;
 use axum::{
     extract::{Path, Query, State},
     response::{Html, Json},
@@ -18,6 +19,12 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+static TELESCOPE_CLIENT: OnceLock<Mutex<Option<TelescopeClient>>> = OnceLock::new();
+
+// Template includes
+const INDEX_HTML: &str = include_str!("../templates/index.html");
+const STYLE_CSS: &str = include_str!("../templates/style.css");
+const SCRIPT_JS: &str = include_str!("../templates/script.js");
 
 // ASCOM Alpaca response structure
 #[derive(Serialize)]
@@ -68,6 +75,18 @@ struct ConnectRequest {
     baud_rate: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct TelescopeConnectRequest {
+    url: String,
+    device_number: u32,
+}
+
+#[derive(Deserialize)]
+struct SlewRequest {
+    ra: f64,
+    dec: f64,
+}
+
 #[derive(Serialize)]
 struct PortListResponse {
     ports: Vec<crate::port_discovery::PortInfo>,
@@ -106,6 +125,16 @@ fn create_router(device_state: SharedState) -> Router {
         .route("/api/connect", post(api_connect))
         .route("/api/disconnect", post(api_disconnect))
         
+        // Telescope control routes
+        .route("/api/telescope/connect", post(api_telescope_connect))
+        .route("/api/telescope/disconnect", post(api_telescope_disconnect))
+        .route("/api/telescope/slew", post(api_telescope_slew))
+        .route("/api/telescope/abort", post(api_telescope_abort))
+        .route("/api/telescope/tracking", post(api_telescope_tracking))
+        .route("/api/telescope/park", post(api_telescope_park))
+        .route("/api/telescope/unpark", post(api_telescope_unpark))
+        .route("/api/telescope/home", post(api_telescope_home))
+        
         // ASCOM Alpaca Management API
         .route("/management/apiversions", get(management_api_versions))
         .route("/management/v1/configureddevices", get(management_configured_devices))
@@ -136,291 +165,12 @@ fn next_server_transaction_id() -> u32 {
 }
 
 // Web interface handler
-async fn web_interface() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Telescope Park Bridge</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-        .container { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
-        .status { padding: 15px; margin: 15px 0; border-radius: 5px; }
-        .connected { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
-        .disconnected { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
-        .safe { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
-        .unsafe { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
-        .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }
-        .info-box { padding: 15px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #3498db; }
-        .info-box h3 { margin-top: 0; color: #2c3e50; }
-        .value { font-weight: bold; color: #27ae60; }
-        .control-panel { background: #e9ecef; padding: 20px; border-radius: 5px; margin: 20px 0; }
-        .control-panel h3 { margin-top: 0; }
-        .endpoints { background: #e9ecef; padding: 20px; border-radius: 5px; margin: 20px 0; }
-        .endpoints h3 { margin-top: 0; }
-        .endpoint { font-family: monospace; background: white; padding: 8px; margin: 5px 0; border-radius: 3px; }
-        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
-        button:hover { background: #2980b9; }
-        button:disabled { background: #95a5a6; cursor: not-allowed; }
-        .btn-success { background: #27ae60; }
-        .btn-success:hover { background: #229954; }
-        .btn-danger { background: #e74c3c; }
-        .btn-danger:hover { background: #c0392b; }
-        select, input { padding: 8px; margin: 5px; border: 1px solid #bdc3c7; border-radius: 3px; }
-        .form-group { margin: 10px 0; }
-        .form-group label { display: inline-block; width: 100px; }
-        #log { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 5px; height: 200px; overflow-y: scroll; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔭 Telescope Park Bridge</h1>
-        
-        <div id="connection-status" class="status disconnected">
-            ⚠️ Checking connection...
-        </div>
-        
-        <div id="safety-status" class="status unsafe">
-            🚫 Safety status unknown
-        </div>
-        
-        <div class="control-panel">
-            <h3>Serial Port Control</h3>
-            <div class="form-group">
-                <label for="port-select">Port:</label>
-                <select id="port-select">
-                    <option value="">Loading ports...</option>
-                </select>
-                <button onclick="refreshPorts()">🔄 Refresh</button>
-            </div>
-            <div class="form-group">
-                <label for="baud-rate">Baud Rate:</label>
-                <input type="number" id="baud-rate" value="115200" min="9600" max="921600">
-            </div>
-            <div class="form-group">
-                <button id="connect-btn" class="btn-success" onclick="connectToPort()">🔌 Connect</button>
-                <button id="disconnect-btn" class="btn-danger" onclick="disconnectFromPort()" disabled>❌ Disconnect</button>
-            </div>
-        </div>
-        
-        <div class="info-grid">
-            <div class="info-box">
-                <h3>Device Information</h3>
-                <p><strong>Name:</strong> <span id="device-name">Loading...</span></p>
-                <p><strong>Version:</strong> <span id="device-version">Loading...</span></p>
-                <p><strong>Manufacturer:</strong> <span id="manufacturer">Loading...</span></p>
-                <p><strong>Serial Port:</strong> <span id="serial-port">Loading...</span></p>
-            </div>
-            
-            <div class="info-box">
-                <h3>Position Data</h3>
-                <p><strong>Current Pitch:</strong> <span id="current-pitch" class="value">--</span>°</p>
-                <p><strong>Current Roll:</strong> <span id="current-roll" class="value">--</span>°</p>
-                <p><strong>Park Pitch:</strong> <span id="park-pitch" class="value">--</span>°</p>
-                <p><strong>Park Roll:</strong> <span id="park-roll" class="value">--</span>°</p>
-                <p><strong>Tolerance:</strong> <span id="tolerance" class="value">--</span>°</p>
-            </div>
-        </div>
-        
-        <div class="endpoints">
-            <h3>ASCOM Alpaca Endpoints</h3>
-            <div class="endpoint">GET /api/v1/safetymonitor/0/connected</div>
-            <div class="endpoint">GET /api/v1/safetymonitor/0/issafe</div>
-            <div class="endpoint">GET /api/v1/safetymonitor/0/name</div>
-            <div class="endpoint">GET /api/v1/safetymonitor/0/description</div>
-        </div>
-        
-        <div>
-            <button onclick="refreshStatus()">🔄 Refresh Status</button>
-            <button onclick="testConnection()">🧪 Test ASCOM</button>
-            <button onclick="clearLog()">🗑️ Clear Log</button>
-        </div>
-        
-        <h3>Activity Log</h3>
-        <div id="log"></div>
-    </div>
-
-    <script>
-        let logElement = document.getElementById('log');
-        let currentlyConnected = false;
-        
-        function log(message) {
-            const timestamp = new Date().toLocaleTimeString();
-            logElement.textContent += '[' + timestamp + '] ' + message + '\n';
-            logElement.scrollTop = logElement.scrollHeight;
-        }
-        
-        function clearLog() {
-            logElement.innerHTML = '';
-        }
-        
-        async function fetchStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                updateUI(data);
-            } catch (error) {
-                log('❌ Failed to fetch status: ' + error.message);
-            }
-        }
-        
-        async function refreshPorts() {
-            try {
-                const response = await fetch('/api/ports');
-                const data = await response.json();
-                const select = document.getElementById('port-select');
-                
-                select.innerHTML = '<option value="">Select a port...</option>';
-                
-                data.ports.forEach(port => {
-                    const option = document.createElement('option');
-                    option.value = port.name;
-                    option.textContent = port.name + ' - ' + port.description;
-                    select.appendChild(option);
-                });
-                
-                log('🔄 Refreshed ' + data.ports.length + ' available ports');
-            } catch (error) {
-                log('❌ Failed to refresh ports: ' + error.message);
-            }
-        }
-        
-        async function connectToPort() {
-            const port = document.getElementById('port-select').value;
-            const baudRate = parseInt(document.getElementById('baud-rate').value);
-            
-            if (!port) {
-                log('❌ Please select a port first');
-                return;
-            }
-            
-            try {
-                const response = await fetch('/api/connect', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ port: port, baud_rate: baudRate })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    log('✅ ' + data.message);
-                    updateConnectionButtons(true);
-                } else {
-                    log('❌ Connection failed: ' + data.message);
-                }
-            } catch (error) {
-                log('❌ Failed to connect: ' + error.message);
-            }
-        }
-        
-        async function disconnectFromPort() {
-            try {
-                const response = await fetch('/api/disconnect', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    log('✅ ' + data.message);
-                    updateConnectionButtons(false);
-                } else {
-                    log('❌ Disconnect failed: ' + data.message);
-                }
-            } catch (error) {
-                log('❌ Failed to disconnect: ' + error.message);
-            }
-        }
-        
-        function updateConnectionButtons(connected) {
-            const connectBtn = document.getElementById('connect-btn');
-            const disconnectBtn = document.getElementById('disconnect-btn');
-            const portSelect = document.getElementById('port-select');
-            const baudRate = document.getElementById('baud-rate');
-            
-            connectBtn.disabled = connected;
-            disconnectBtn.disabled = !connected;
-            portSelect.disabled = connected;
-            baudRate.disabled = connected;
-            
-            currentlyConnected = connected;
-        }
-        
-        function updateUI(data) {
-            const connStatus = document.getElementById('connection-status');
-            if (data.connected) {
-                connStatus.className = 'status connected';
-                connStatus.innerHTML = '✅ Connected to device';
-                updateConnectionButtons(true);
-            } else {
-                connStatus.className = 'status disconnected';
-                connStatus.innerHTML = '❌ Not connected to device';
-                if (data.error_message) {
-                    connStatus.innerHTML += ' - ' + data.error_message;
-                }
-                updateConnectionButtons(false);
-            }
-            
-            const safetyStatus = document.getElementById('safety-status');
-            if (data.connected) {
-                if (data.is_safe) {
-                    safetyStatus.className = 'status safe';
-                    safetyStatus.innerHTML = '✅ Telescope is PARKED (Safe)';
-                } else {
-                    safetyStatus.className = 'status unsafe';
-                    safetyStatus.innerHTML = '⚠️ Telescope is NOT PARKED (Unsafe)';
-                }
-            } else {
-                safetyStatus.className = 'status unsafe';
-                safetyStatus.innerHTML = '🚫 Safety status unknown (disconnected)';
-            }
-            
-            document.getElementById('device-name').textContent = data.device_name;
-            document.getElementById('device-version').textContent = data.device_version;
-            document.getElementById('manufacturer').textContent = data.manufacturer;
-            document.getElementById('serial-port').textContent = data.serial_port || 'Not connected';
-            
-            document.getElementById('current-pitch').textContent = data.current_pitch.toFixed(2);
-            document.getElementById('current-roll').textContent = data.current_roll.toFixed(2);
-            document.getElementById('park-pitch').textContent = data.park_pitch.toFixed(2);
-            document.getElementById('park-roll').textContent = data.park_roll.toFixed(2);
-            document.getElementById('tolerance').textContent = data.position_tolerance.toFixed(1);
-        }
-        
-        function refreshStatus() {
-            log('🔄 Refreshing status...');
-            fetchStatus();
-        }
-        
-        async function testConnection() {
-            log('🧪 Testing ASCOM connection...');
-            try {
-                const response = await fetch('/api/v1/safetymonitor/0/connected');
-                const data = await response.json();
-                if (data.ErrorNumber === 0) {
-                    log('✅ ASCOM test successful - Connected: ' + data.Value);
-                } else {
-                    log('❌ ASCOM test failed - Error: ' + data.ErrorMessage);
-                }
-            } catch (error) {
-                log('❌ ASCOM test failed: ' + error.message);
-            }
-        }
-        
-        // Auto-refresh every 5 seconds
-        setInterval(fetchStatus, 5000);
-        
-        // Initial load
-        log('🚀 Web interface loaded');
-        fetchStatus();
-        refreshPorts();
-    </script>
-</body>
-</html>"#)
+async fn web_interface() -> Html<String> {
+    let html = INDEX_HTML
+        .replace("{{STYLE_CSS}}", STYLE_CSS)
+        .replace("{{SCRIPT_JS}}", SCRIPT_JS);
+    
+    Html(html)
 }
 
 async fn api_status(State(state): State<SharedState>) -> Json<DeviceState> {
@@ -500,6 +250,329 @@ async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectRespons
     })
 }
 
+// Telescope API handlers
+async fn api_telescope_connect(
+    State(state): State<SharedState>,
+    ExtractJson(request): ExtractJson<TelescopeConnectRequest>,
+) -> Json<ConnectResponse> {
+    tracing::info!("Connecting to telescope at {} device {}", request.url, request.device_number);
+    
+    let client = TelescopeClient::new(request.url.clone(), request.device_number);
+    
+    // Test connection
+    match client.set_connected(true).await {
+        Ok(()) => {
+            // Store the client
+            let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+            if let Ok(mut current_client) = client_mutex.lock() {
+                *current_client = Some(client);
+            }
+            
+            // Update device state
+            {
+                let mut device_state = state.write().await;
+                device_state.telescope_connected = true;
+                device_state.telescope_url = Some(request.url.clone());
+                device_state.telescope_device_number = request.device_number;
+            }
+            
+            // Start telescope status monitoring
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                telescope_status_monitor(state_clone).await;
+            });
+            
+            Json(ConnectResponse {
+                success: true,
+                message: format!("Connected to telescope at {}", request.url),
+            })
+        }
+        Err(e) => {
+            Json(ConnectResponse {
+                success: false,
+                message: format!("Failed to connect to telescope: {}", e),
+            })
+        }
+    }
+}
+
+async fn api_telescope_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Disconnecting from telescope");
+    
+    // Get client and disconnect - using clone pattern to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(mut current_client) = client_mutex.lock() {
+            current_client.take()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.set_connected(false).await
+    } else {
+        Ok(())
+    };
+    
+    // Update device state
+    {
+        let mut device_state = state.write().await;
+        device_state.telescope_connected = false;
+        device_state.telescope_url = None;
+    }
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Disconnected from telescope".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Error disconnecting: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_slew(
+    State(_state): State<SharedState>,
+    ExtractJson(request): ExtractJson<SlewRequest>,
+) -> Json<ConnectResponse> {
+    tracing::info!("Slewing telescope to RA: {}, Dec: {}", request.ra, request.dec);
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.slew_to_coordinates(request.ra, request.dec).await
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: format!("Slewing to RA: {}, Dec: {}", request.ra, request.dec),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Slew failed: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_abort(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Aborting telescope slew");
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.abort_slew().await
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Slew aborted".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Abort failed: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_tracking(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Toggling telescope tracking");
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        // Get current tracking state and toggle it
+        match client.get_status().await {
+            Ok(status) => client.set_tracking(!status.tracking).await,
+            Err(e) => Err(e),
+        }
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Tracking toggled".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Tracking toggle failed: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_park(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Parking telescope");
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.park().await
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Telescope parking".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Park failed: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_unpark(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Unparking telescope");
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.unpark().await
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Telescope unparking".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Unpark failed: {}", e),
+        }),
+    }
+}
+
+async fn api_telescope_home(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    tracing::info!("Finding telescope home");
+    
+    // Get a clone of the client to avoid holding guard across await
+    let client_option = {
+        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+        if let Ok(current_client) = client_mutex.lock() {
+            current_client.as_ref().cloned()
+        } else {
+            None
+        }
+    };
+    
+    let result = if let Some(client) = client_option {
+        client.find_home().await
+    } else {
+        Err("No telescope connected".into())
+    };
+    
+    match result {
+        Ok(()) => Json(ConnectResponse {
+            success: true,
+            message: "Telescope finding home".to_string(),
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Find home failed: {}", e),
+        }),
+    }
+}
+
+// Telescope status monitoring background task
+async fn telescope_status_monitor(device_state: SharedState) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+    
+    loop {
+        interval.tick().await;
+        
+        // Get the client outside the async block to avoid holding the mutex across await
+        let client_option = {
+            let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
+            if let Ok(current_client) = client_mutex.lock() {
+                current_client.as_ref().cloned()
+            } else {
+                None
+            }
+        };
+        
+        if let Some(client) = client_option {
+            match client.get_status().await {
+                Ok(telescope_status) => {
+                    let mut state = device_state.write().await;
+                    state.telescope_status = telescope_status;
+                    state.update_timestamp();
+                }
+                Err(_) => {
+                    // Lost connection to telescope
+                    let mut state = device_state.write().await;
+                    if state.telescope_connected {
+                        state.telescope_connected = false;
+                        tracing::warn!("Lost connection to telescope");
+                    }
+                    break;
+                }
+            }
+        } else {
+            // No telescope client available
+            let mut state = device_state.write().await;
+            if state.telescope_connected {
+                state.telescope_connected = false;
+                tracing::warn!("Telescope client not available");
+            }
+            break;
+        }
+    }
+}
+
 // ASCOM Management API handlers
 async fn management_api_versions(Query(query): Query<AlpacaQuery>) -> Json<AlpacaResponse<Vec<u32>>> {
     Json(AlpacaResponse::success(
@@ -564,7 +637,7 @@ async fn get_connected(
 async fn get_description(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(

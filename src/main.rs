@@ -9,6 +9,7 @@ mod alpaca_server;
 mod device_state;
 mod errors;
 mod port_discovery;
+mod telescope_client;
 
 use crate::device_state::DeviceState;
 use crate::alpaca_server::create_alpaca_server;

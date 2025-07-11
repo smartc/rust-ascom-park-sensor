@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telescope Park Bridge v2.0</title>
+    <style>
+        {{STYLE_CSS}}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔭 Telescope Park Bridge v2.0</h1>
+        
+        <div class="tab-container">
+            <div class="tab-buttons">
+                <button class="tab-button active" onclick="switchTab('park-sensor')">🛡️ Park Sensor</button>
+                <button class="tab-button" onclick="switchTab('telescope')">🔭 Telescope Control</button>
+                <button class="tab-button" onclick="switchTab('logs')">📋 Activity Logs</button>
+            </div>
+            
+            <!-- Park Sensor Tab -->
+            <div id="park-sensor" class="tab-content active">
+                <div id="connection-status" class="status disconnected">
+                    ⚠️ Checking connection...
+                </div>
+                
+                <div id="safety-status" class="status unsafe">
+                    🚫 Safety status unknown
+                </div>
+                
+                <div class="control-panel">
+                    <h3>Serial Port Control</h3>
+                    <div class="form-group">
+                        <label for="port-select">Port:</label>
+                        <select id="port-select">
+                            <option value="">Loading ports...</option>
+                        </select>
+                        <button onclick="refreshPorts()">🔄 Refresh</button>
+                    </div>
+                    <div class="form-group">
+                        <label for="baud-rate">Baud Rate:</label>
+                        <input type="number" id="baud-rate" value="115200" min="9600" max="921600">
+                    </div>
+                    <div class="form-group">
+                        <button id="connect-btn" class="btn-success" onclick="connectToPort()">🔌 Connect</button>
+                        <button id="disconnect-btn" class="btn-danger" onclick="disconnectFromPort()" disabled>❌ Disconnect</button>
+                    </div>
+                </div>
+                
+                <div class="info-grid">
+                    <div class="info-box">
+                        <h3>Device Information</h3>
+                        <p><strong>Name:</strong> <span id="device-name">Loading...</span></p>
+                        <p><strong>Version:</strong> <span id="device-version">Loading...</span></p>
+                        <p><strong>Manufacturer:</strong> <span id="manufacturer">Loading...</span></p>
+                        <p><strong>Serial Port:</strong> <span id="serial-port">Loading...</span></p>
+                    </div>
+                    
+                    <div class="info-box">
+                        <h3>Position Data</h3>
+                        <p><strong>Current Pitch:</strong> <span id="current-pitch" class="value">--</span>°</p>
+                        <p><strong>Current Roll:</strong> <span id="current-roll" class="value">--</span>°</p>
+                        <p><strong>Park Pitch:</strong> <span id="park-pitch" class="value">--</span>°</p>
+                        <p><strong>Park Roll:</strong> <span id="park-roll" class="value">--</span>°</p>
+                        <p><strong>Tolerance:</strong> <span id="tolerance" class="value">--</span>°</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Telescope Control Tab -->
+            <div id="telescope" class="tab-content">
+                <div id="telescope-status" class="status disconnected">
+                    ⚠️ Telescope not connected
+                </div>
+                
+                <div class="control-panel">
+                    <h3>Telescope Connection</h3>
+                    <div class="form-group">
+                        <label for="telescope-url">ASCOM URL:</label>
+                        <input type="text" id="telescope-url" value="http://localhost:11111" style="width: 200px;">
+                    </div>
+                    <div class="form-group">
+                        <label for="telescope-device">Device Number:</label>
+                        <input type="number" id="telescope-device" value="0" min="0" max="99">
+                    </div>
+                    <div class="form-group">
+                        <button id="telescope-connect-btn" class="btn-success" onclick="connectTelescope()">🔌 Connect</button>
+                        <button id="telescope-disconnect-btn" class="btn-danger" onclick="disconnectTelescope()" disabled>❌ Disconnect</button>
+                    </div>
+                </div>
+                
+                <div class="telescope-grid">
+                    <div class="info-box">
+                        <h3>Telescope Status</h3>
+                        <p><strong>Name:</strong> <span id="telescope-name">--</span></p>
+                        <p><strong>Tracking:</strong> <span id="telescope-tracking" class="value">--</span></p>
+                        <p><strong>Slewing:</strong> <span id="telescope-slewing" class="value">--</span></p>
+                        <p><strong>At Park:</strong> <span id="telescope-at-park" class="value">--</span></p>
+                        <p><strong>At Home:</strong> <span id="telescope-at-home" class="value">--</span></p>
+                        <p><strong>Pier Side:</strong> <span id="telescope-pier-side" class="value">--</span></p>
+                    </div>
+                    
+                    <div class="info-box">
+                        <h3>Current Position</h3>
+                        <p><strong>RA:</strong> <span id="telescope-ra" class="value">--</span>h</p>
+                        <p><strong>Dec:</strong> <span id="telescope-dec" class="value">--</span>°</p>
+                        <p><strong>Azimuth:</strong> <span id="telescope-azimuth" class="value">--</span>°</p>
+                        <p><strong>Altitude:</strong> <span id="telescope-altitude" class="value">--</span>°</p>
+                    </div>
+                </div>
+                
+                <div class="info-grid">
+                    <div class="coordinate-control">
+                        <h4>Slew to Coordinates</h4>
+                        <div class="form-group">
+                            <label for="slew-ra">RA (hours):</label>
+                            <input type="number" id="slew-ra" class="coordinate-input" step="0.001" min="0" max="24">
+                        </div>
+                        <div class="form-group">
+                            <label for="slew-dec">Dec (degrees):</label>
+                            <input type="number" id="slew-dec" class="coordinate-input" step="0.001" min="-90" max="90">
+                        </div>
+                        <button id="slew-btn" class="btn-warning" onclick="slewToCoordinates()" disabled>🎯 Slew</button>
+                        <button id="abort-btn" class="btn-danger" onclick="abortSlew()" disabled>⏹️ Abort</button>
+                    </div>
+                    
+                    <div class="coordinate-control">
+                        <h4>Telescope Control</h4>
+                        <button id="tracking-btn" class="btn-large" onclick="toggleTracking()" disabled>🎯 Toggle Tracking</button><br>
+                        <button id="park-btn" class="btn-large btn-warning" onclick="parkTelescope()" disabled>🏠 Park</button>
+                        <button id="unpark-btn" class="btn-large btn-success" onclick="unparkTelescope()" disabled>🚀 Unpark</button><br>
+                        <button id="home-btn" class="btn-large" onclick="findHome()" disabled>🏁 Find Home</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Activity Logs Tab -->
+            <div id="logs" class="tab-content">
+                <div class="endpoints">
+                    <h3>ASCOM Alpaca Endpoints</h3>
+                    <div class="endpoint">GET /api/v1/safetymonitor/0/connected</div>
+                    <div class="endpoint">GET /api/v1/safetymonitor/0/issafe</div>
+                    <div class="endpoint">GET /api/v1/safetymonitor/0/name</div>
+                    <div class="endpoint">GET /api/v1/safetymonitor/0/description</div>
+                </div>
+                
+                <div>
+                    <button onclick="refreshStatus()">🔄 Refresh Status</button>
+                    <button onclick="testConnection()">🧪 Test ASCOM</button>
+                    <button onclick="clearLog()">🗑️ Clear Log</button>
+                </div>
+                
+                <h3>Activity Log</h3>
+                <div id="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        {{SCRIPT_JS}}
+    </script>
+</body>
+</html>

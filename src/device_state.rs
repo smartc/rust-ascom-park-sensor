@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceState {
+    // Park sensor state
     pub connected: bool,
     pub is_safe: bool,  // In ASCOM terms, "safe" means parked
     pub current_pitch: f32,
@@ -16,6 +17,12 @@ pub struct DeviceState {
     pub manufacturer: String,
     pub serial_port: Option<String>,
     pub error_message: Option<String>,
+    
+    // Telescope state
+    pub telescope_connected: bool,
+    pub telescope_url: Option<String>,
+    pub telescope_device_number: u32,
+    pub telescope_status: crate::telescope_client::TelescopeStatus,
 }
 
 impl Default for DeviceState {
@@ -27,6 +34,7 @@ impl Default for DeviceState {
 impl DeviceState {
     pub fn new() -> Self {
         Self {
+            // Park sensor defaults
             connected: false,
             is_safe: false,
             current_pitch: 0.0,
@@ -40,6 +48,12 @@ impl DeviceState {
             manufacturer: "Corey Smart".to_string(),
             serial_port: None,
             error_message: None,
+            
+            // Telescope defaults
+            telescope_connected: false,
+            telescope_url: None,
+            telescope_device_number: 0,
+            telescope_status: crate::telescope_client::TelescopeStatus::default(),
         }
     }
     
