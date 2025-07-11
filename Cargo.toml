@@ -1,15 +1,14 @@
 [package]
 name = "telescope_park_bridge"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
+description = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor"
+authors = ["Corey Smart"]
 
 [dependencies]
 # Serial communication
 serialport = "4.3"
 tokio-serial = "5.4"
-
-# ASCOM Alpaca library
-ascom-alpaca = { version = "1.0.0-beta.3", features = ["client", "telescope", "safetymonitor"] }
 
 # HTTP server for web interface and ASCOM Alpaca API
 axum = { version = "0.7", features = ["macros"] }
@@ -34,7 +33,6 @@ thiserror = "1.0"
 
 # Utilities
 uuid = { version = "1.0", features = ["v4"] }
-include_dir = "0.7"
 
 # For ASCOM device discovery on Windows
 [target.'cfg(windows)'.dependencies]
