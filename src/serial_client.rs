@@ -1,6 +1,5 @@
-use crate::device_state::DeviceState;
+use crate::device_state::{DeviceState, FirmwareResponse, StatusResponse, PositionResponse, ParkStatusResponse};
 use crate::errors::{BridgeError, Result};
-use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9,64 +8,12 @@ use tokio::time::{interval, timeout};
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug, Deserialize)]
-struct SerialResponse {
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PositionData {
-    pitch: f32,
-    roll: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct ParkedData {
-    parked: bool,
-    #[serde(rename = "currentPitch")]
-    current_pitch: f32,
-    #[serde(rename = "currentRoll")]
-    current_roll: f32,
-    #[serde(rename = "parkPitch")]
-    park_pitch: f32,
-    #[serde(rename = "parkRoll")]
-    park_roll: f32,
-    tolerance: f32,
-    #[serde(rename = "pitchDiff")]
-    pitch_diff: f32,
-    #[serde(rename = "rollDiff")]
-    roll_diff: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct StatusData {
-    #[serde(rename = "deviceName")]
-    device_name: String,
-    version: String,
-    manufacturer: String,
-    parked: bool,
-    calibrated: bool,
-    #[serde(rename = "buttonPressed")]
-    button_pressed: bool,
-    #[serde(rename = "ledStatus")]
-    led_status: bool,
-    #[serde(rename = "freeHeap")]
-    free_heap: u64,
-    uptime: u64,
-}
-
 pub async fn run_serial_client(
     port_name: String,
     baud_rate: u32,
     device_state: Arc<RwLock<DeviceState>>,
 ) -> Result<()> {
-    info!("Starting serial client for port: {}", port_name);
+    info!("Starting serial client for nRF52840 device on port: {}", port_name);
 
     // Update device state with port info
     {
@@ -104,18 +51,22 @@ async fn connect_and_monitor(
     baud_rate: u32,
     device_state: Arc<RwLock<DeviceState>>,
 ) -> Result<()> {
-    info!("Connecting to {} at {} baud", port_name, baud_rate);
+    info!("Connecting to nRF52840 at {} at {} baud", port_name, baud_rate);
     
-    // Open serial port
+    // Open serial port with settings appropriate for nRF52840
     let port = tokio_serial::new(port_name, baud_rate)
         .timeout(Duration::from_millis(1000))
+        .data_bits(tokio_serial::DataBits::Eight)
+        .flow_control(tokio_serial::FlowControl::None)
+        .parity(tokio_serial::Parity::None)
+        .stop_bits(tokio_serial::StopBits::One)
         .open_native_async()?;
     
-    // Set up buffered reader
+    // Set up buffered reader/writer
     let (reader, mut writer) = tokio::io::split(port);
     let mut reader = BufReader::new(reader);
     
-    info!("Serial connection established");
+    info!("Serial connection established to nRF52840 device");
     
     // Mark as connected and clear any errors
     {
@@ -124,12 +75,17 @@ async fn connect_and_monitor(
         state.clear_error();
     }
     
-    // Set up periodic polling
-    let mut poll_interval = interval(Duration::from_secs(2));
-    let mut status_interval = interval(Duration::from_secs(10));
+    // Wait a moment for device to be ready
+    tokio::time::sleep(Duration::from_millis(500)).await;
     
-    // Initial status query
-    send_command(&mut writer, "01").await?;  // Get status
+    // Set up periodic polling intervals
+    let mut status_interval = interval(Duration::from_secs(10)); // Device status every 10s
+    let mut position_interval = interval(Duration::from_secs(3)); // Position/park status every 3s
+    
+    // Initial device inquiry - wait a bit more for device to be ready
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    info!("Sending initial status query to nRF52840");
+    send_command(&mut writer, "01").await?;  // Get device status
     
     loop {
         tokio::select! {
@@ -138,8 +94,12 @@ async fn connect_and_monitor(
                 match result {
                     Ok(response) => {
                         if let Err(e) = process_response(response, device_state.clone()).await {
-                            error!("Error processing response: {}", e);
+                            warn!("Error processing response: {}", e);
                         }
+                    }
+                    Err(BridgeError::Timeout) => {
+                        // Timeout is not necessarily an error, just continue
+                        debug!("No response from device (timeout)");
                     }
                     Err(e) => {
                         error!("Error reading from serial: {}", e);
@@ -148,20 +108,20 @@ async fn connect_and_monitor(
                 }
             }
             
-            // Periodic position polling
-            _ = poll_interval.tick() => {
-                debug!("Polling device position");
-                if let Err(e) = send_command(&mut writer, "03").await {  // Is parked?
-                    error!("Error sending position poll: {}", e);
+            // Periodic device status check
+            _ = status_interval.tick() => {
+                debug!("Polling device status");
+                if let Err(e) = send_command(&mut writer, "01").await {  // CMD_GET_STATUS
+                    error!("Error sending status check: {}", e);
                     return Err(e);
                 }
             }
             
-            // Periodic status check
-            _ = status_interval.tick() => {
-                debug!("Checking device status");
-                if let Err(e) = send_command(&mut writer, "01").await {  // Get status
-                    error!("Error sending status check: {}", e);
+            // Periodic position and park status check
+            _ = position_interval.tick() => {
+                debug!("Polling park status");
+                if let Err(e) = send_command(&mut writer, "03").await {  // CMD_IS_PARKED
+                    error!("Error sending park status check: {}", e);
                     return Err(e);
                 }
             }
@@ -171,7 +131,7 @@ async fn connect_and_monitor(
 
 async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStream>, command: &str) -> Result<()> {
     let command_str = format!("<{}>\n", command);
-    debug!("Sending command: {}", command_str.trim());
+    debug!("Sending command to nRF52840: {}", command_str.trim());
     
     writer.write_all(command_str.as_bytes()).await?;
     writer.flush().await?;
@@ -182,36 +142,59 @@ async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStre
 async fn read_response(reader: &mut BufReader<tokio::io::ReadHalf<tokio_serial::SerialStream>>) -> Result<String> {
     let mut line = String::new();
     
-    // Add timeout to prevent hanging
-    match timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
-        Ok(Ok(_)) => {
+    // Add timeout to prevent hanging - reduced to 3 seconds
+    match timeout(Duration::from_secs(3), reader.read_line(&mut line)).await {
+        Ok(Ok(bytes_read)) => {
+            if bytes_read == 0 {
+                return Err(BridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Device disconnected"
+                )));
+            }
+            
             let trimmed = line.trim();
-            debug!("Received: {}", trimmed);
+            if !trimmed.is_empty() {
+                debug!("Received from nRF52840: {}", trimmed);
+            }
             Ok(trimmed.to_string())
         }
-        Ok(Err(e)) => Err(BridgeError::Io(e)),
-        Err(_) => Err(BridgeError::Timeout),
+        Ok(Err(e)) => {
+            error!("IO error reading from nRF52840: {}", e);
+            Err(BridgeError::Io(e))
+        }
+        Err(_) => {
+            debug!("Timeout waiting for nRF52840 response");
+            Err(BridgeError::Timeout)
+        }
     }
 }
 
 async fn process_response(response: String, device_state: Arc<RwLock<DeviceState>>) -> Result<()> {
-    // Skip empty lines and notifications
-    if response.is_empty() {
+    // Skip empty lines and device startup messages
+    if response.is_empty() || response.starts_with("=====") || response.starts_with("Device ready") {
+        return Ok(());
+    }
+    
+    // Skip debug messages from device
+    if response.starts_with("=== ") || response.contains("Debug") {
+        debug!("Device debug message: {}", response);
         return Ok(());
     }
     
     // Try to parse as JSON
-    let parsed: SerialResponse = match serde_json::from_str(&response) {
+    let parsed: FirmwareResponse = match serde_json::from_str(&response) {
         Ok(parsed) => parsed,
-        Err(_) => {
-            debug!("Non-JSON response (possibly notification): {}", response);
-            return Ok(());  // Not an error, just ignore non-JSON responses
+        Err(e) => {
+            // Log non-JSON responses as device messages
+            debug!("Non-JSON response from device: {} (parse error: {})", response, e);
+            return Ok(());
         }
     };
     
-    debug!("Parsed response: {:?}", parsed);
+    debug!("Parsed firmware response: status={}, has_data={}", 
+           parsed.status, parsed.data.is_some());
     
-    // Handle different response types
+    // Handle different response types based on firmware's serial_interface.cpp
     match parsed.status.as_str() {
         "ok" => {
             if let Some(data) = parsed.data {
@@ -221,18 +204,18 @@ async fn process_response(response: String, device_state: Arc<RwLock<DeviceState
         "ack" => {
             // Command acknowledged, just log it
             if let Some(command) = parsed.command {
-                debug!("Command {} acknowledged", command);
+                debug!("Command {} acknowledged by nRF52840", command);
             }
         }
         "error" => {
             let error_msg = parsed.message.unwrap_or_else(|| "Unknown device error".to_string());
-            warn!("Device reported error: {}", error_msg);
+            warn!("nRF52840 reported error: {}", error_msg);
             
             let mut state = device_state.write().await;
             state.set_error(&error_msg);
         }
         _ => {
-            warn!("Unknown response status: {}", parsed.status);
+            warn!("Unknown response status from nRF52840: {}", parsed.status);
         }
     }
     
@@ -245,42 +228,51 @@ async fn update_device_state_from_data(
 ) -> Result<()> {
     let mut state = device_state.write().await;
     
-    // Try to parse as different data types
+    // Try to parse as different data types based on the firmware responses
     
-    // Check if it's position data
-    if let Ok(position_data) = serde_json::from_value::<PositionData>(data.clone()) {
-        debug!("Updating position: pitch={}, roll={}", position_data.pitch, position_data.roll);
-        state.current_pitch = position_data.pitch;
-        state.current_roll = position_data.roll;
-        state.update_timestamp();
+    // Check if it's device status data (from CMD_GET_STATUS - "01")
+    if let Ok(status_data) = serde_json::from_value::<StatusResponse>(data.clone()) {
+        debug!("Updating device status from nRF52840: parked={}, calibrated={}", 
+               status_data.parked, status_data.calibrated);
+        state.update_from_status(&status_data);
         return Ok(());
     }
     
-    // Check if it's parked status data
-    if let Ok(parked_data) = serde_json::from_value::<ParkedData>(data.clone()) {
-        debug!("Updating park status: parked={}", parked_data.parked);
-        state.is_safe = parked_data.parked;  // In ASCOM, "safe" means parked
-        state.current_pitch = parked_data.current_pitch;
-        state.current_roll = parked_data.current_roll;
-        state.park_pitch = parked_data.park_pitch;
-        state.park_roll = parked_data.park_roll;
-        state.position_tolerance = parked_data.tolerance;
-        state.update_timestamp();
+    // Check if it's position data (from CMD_GET_POSITION - "02")
+    if let Ok(position_data) = serde_json::from_value::<PositionResponse>(data.clone()) {
+        debug!("Updating position from nRF52840: pitch={:.2}, roll={:.2}", 
+               position_data.pitch, position_data.roll);
+        state.update_from_position(&position_data);
         return Ok(());
     }
     
-    // Check if it's status data
-    if let Ok(status_data) = serde_json::from_value::<StatusData>(data.clone()) {
-        debug!("Updating device status");
-        state.device_name = status_data.device_name;
-        state.device_version = status_data.version;
-        state.manufacturer = status_data.manufacturer;
-        state.is_safe = status_data.parked;
-        state.update_timestamp();
+    // Check if it's park status data (from CMD_IS_PARKED - "03")
+    if let Ok(park_data) = serde_json::from_value::<ParkStatusResponse>(data.clone()) {
+        debug!("Updating park status from nRF52840: parked={}, pitch={:.2}, roll={:.2}", 
+               park_data.parked, park_data.current_pitch, park_data.current_roll);
+        state.update_from_park_status(&park_data);
         return Ok(());
     }
     
-    // If we can't parse it as any known type, just log it
-    debug!("Unknown data format: {}", data);
+    // If it's a simple message response
+    if let Some(message) = data.get("message") {
+        if let Some(msg_str) = message.as_str() {
+            info!("nRF52840 message: {}", msg_str);
+            return Ok(());
+        }
+    }
+    
+    // Log unknown data format for debugging
+    debug!("Unknown data format from nRF52840: {}", data);
     Ok(())
+}
+
+// Public function to send commands from web interface
+pub async fn send_device_command(
+    device_state: Arc<RwLock<DeviceState>>,
+    command: &str,
+) -> Result<String> {
+    // This function would need access to the writer, which we'd need to refactor
+    // For now, return an error indicating this needs implementation
+    Err(BridgeError::CommandFailed("Command sending not yet implemented".to_string()))
 }

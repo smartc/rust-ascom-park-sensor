@@ -9,7 +9,6 @@ mod alpaca_server;
 mod device_state;
 mod errors;
 mod port_discovery;
-mod telescope_client;
 
 use crate::device_state::DeviceState;
 use crate::alpaca_server::create_alpaca_server;
@@ -17,10 +16,10 @@ use crate::port_discovery::discover_ports;
 
 #[derive(Parser, Debug)]
 #[command(name = "telescope_park_bridge")]
-#[command(about = "ASCOM Alpaca bridge for ESP32 Telescope Park Sensor v0.2.1")]
-#[command(version = "0.2.1")]
+#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.3.0")]
+#[command(version = "0.3.0")]
 struct Args {
-    /// Serial port (e.g., COM3, /dev/ttyUSB0)
+    /// Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)
     #[arg(short, long)]
     port: Option<String>,
     
@@ -36,7 +35,7 @@ struct Args {
     #[arg(long, default_value = "11111")]
     http_port: u16,
     
-    /// Auto-select first available ESP32-like device
+    /// Auto-select first available nRF52840-like device
     #[arg(long)]
     auto: bool,
     
@@ -55,30 +54,33 @@ async fn main() -> Result<()> {
         .with_env_filter(format!("telescope_park_bridge={}", log_level))
         .init();
     
-    info!("Starting Telescope Park Bridge v0.2.1");
-    info!("New features: ASCOM library integration, local telescope support, manual slew controls");
+    info!("Starting Telescope Park Bridge v0.3.0");
+    info!("Target device: nRF52840 XIAO Sense with built-in IMU");
     
-    // Only use command-line specified port or auto-select, skip interactive selection
+    // Handle port selection
     let serial_port = if let Some(port) = args.port {
         info!("Using specified port: {}", port);
         Some(port)
     } else if args.auto {
-        info!("Auto-selecting ESP32 device...");
+        info!("Auto-selecting nRF52840 device...");
         match discover_ports() {
             Ok(ports) => {
-                // Look for ESP32-like devices first
+                // Look for nRF52840-like devices first
                 let mut found_port = None;
                 for port in &ports {
-                    if port.description.to_lowercase().contains("esp32") || 
-                       port.description.to_lowercase().contains("ch340") ||
-                       port.description.to_lowercase().contains("cp210") {
-                        info!("Auto-selected ESP32-like device: {} ({})", port.name, port.description);
+                    let desc_lower = port.description.to_lowercase();
+                    if desc_lower.contains("nrf52") || 
+                       desc_lower.contains("xiao") ||
+                       desc_lower.contains("seeed") ||
+                       desc_lower.contains("ch340") ||
+                       desc_lower.contains("cp210") {
+                        info!("Auto-selected nRF52840-like device: {} ({})", port.name, port.description);
                         found_port = Some(port.name.clone());
                         break;
                     }
                 }
                 
-                // If no ESP32-like device found, use first available
+                // If no nRF52840-like device found, use first available
                 found_port.or_else(|| {
                     if !ports.is_empty() {
                         info!("Auto-selected first available port: {}", ports[0].name);

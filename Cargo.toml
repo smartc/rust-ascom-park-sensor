@@ -5,6 +5,14 @@ edition = "2021"
 description = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor"
 authors = ["Corey Smart"]
 
+[[bin]]
+name = "telescope_park_bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_device"
+path = "src/bin/test_device.rs"
+
 [dependencies]
 # Serial communication
 serialport = "4.3"

@@ -22,6 +22,12 @@ pub enum BridgeError {
     
     #[error("Device error: {0}")]
     Device(String),
+    
+    #[error("Command failed: {0}")]
+    CommandFailed(String),
+    
+    #[error("Invalid command format: {0}")]
+    InvalidCommand(String),
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;

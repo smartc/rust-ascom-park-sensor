@@ -1,6 +1,4 @@
-
 use crate::device_state::DeviceState;
-use crate::telescope_client::{TelescopeClient, TelescopeConnection, SlewDirection};
 use axum::{
     extract::{Path, Query, State},
     response::{Html, Json},
@@ -10,19 +8,19 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 // Global to track the current serial connection task
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-static TELESCOPE_CLIENT: OnceLock<Mutex<Option<TelescopeClient>>> = OnceLock::new();
 
-// Template includes
+// External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
 const STYLE_CSS: &str = include_str!("../templates/style.css");
 const SCRIPT_JS: &str = include_str!("../templates/script.js");
@@ -76,25 +74,9 @@ struct ConnectRequest {
     baud_rate: Option<u32>,
 }
 
-// Single TelescopeConnectRequest definition
 #[derive(Deserialize)]
-struct TelescopeConnectRequest {
-    connection_type: String,  // "alpaca" or "local"
-    url: Option<String>,
-    device_number: Option<u32>,
-    prog_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SlewRequest {
-    ra: f64,
-    dec: f64,
-}
-
-#[derive(Deserialize)]
-struct ManualSlewRequest {
-    direction: String,  // "north", "south", "east", "west"
-    rate: Option<f64>,  // Slew rate (degrees per second)
+struct CommandRequest {
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -109,12 +91,14 @@ struct ConnectResponse {
 }
 
 #[derive(Serialize)]
-struct TelescopeListResponse {
-    telescopes: Vec<String>,
+struct CommandResponse {
+    success: bool,
+    command: String,
+    response: Option<String>,
+    message: String,
 }
 
 type SharedState = Arc<RwLock<DeviceState>>;
-
 
 pub async fn create_alpaca_server(
     bind_address: String,
@@ -140,20 +124,12 @@ fn create_router(device_state: SharedState) -> Router {
         .route("/api/ports", get(api_ports))
         .route("/api/connect", post(api_connect))
         .route("/api/disconnect", post(api_disconnect))
+        .route("/api/command", post(api_send_command))
         
-        // Telescope control routes
-        .route("/api/telescope/connect", post(api_telescope_connect))
-        .route("/api/telescope/disconnect", post(api_telescope_disconnect))
-        .route("/api/telescope/slew", post(api_telescope_slew))
-        .route("/api/telescope/abort", post(api_telescope_abort))
-        .route("/api/telescope/tracking", post(api_telescope_tracking))
-        .route("/api/telescope/park", post(api_telescope_park))
-        .route("/api/telescope/unpark", post(api_telescope_unpark))
-        .route("/api/telescope/home", post(api_telescope_home))
-        .route("/api/telescope/list", get(api_telescope_list))
-        .route("/api/telescope/slew/manual", post(api_telescope_manual_slew))
-        .route("/api/telescope/slew/stop", post(api_telescope_stop_slew))
-        .route("/api/telescope/axis_rates", get(api_telescope_axis_rates))
+        // Device control routes
+        .route("/api/device/calibrate", post(api_calibrate))
+        .route("/api/device/set_park", post(api_set_park))
+        .route("/api/device/factory_reset", post(api_factory_reset))
 
         // ASCOM Alpaca Management API
         .route("/management/apiversions", get(management_api_versions))
@@ -243,16 +219,20 @@ async fn api_connect(
     
     Json(ConnectResponse {
         success: true,
-        message: format!("Connecting to {} at {} baud", request.port, baud_rate),
+        message: format!("Connecting to nRF52840 device on {} at {} baud", request.port, baud_rate),
     })
 }
 
 async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
-    // Abort the current serial task
+    info!("Disconnecting from nRF52840 device");
+    
+    // Abort the current serial task and wait for it to complete
     let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
     if let Ok(mut current_task) = task_mutex.lock() {
         if let Some(task) = current_task.take() {
             task.abort();
+            // Give it a moment to clean up
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     
@@ -264,480 +244,51 @@ async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectRespons
         device_state.clear_error();
     }
     
+    // Wait a bit more to ensure port is released
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
     Json(ConnectResponse {
         success: true,
-        message: "Disconnected from serial device".to_string(),
+        message: "Disconnected from nRF52840 device".to_string(),
     })
 }
 
-// Telescope API handlers
-async fn api_telescope_connect(
-    State(state): State<SharedState>,
-    ExtractJson(request): ExtractJson<TelescopeConnectRequest>,
-) -> Json<ConnectResponse> {
-    let connection = match request.connection_type.as_str() {
-        "alpaca" => {
-            let url = match request.url {
-                Some(url) => url,
-                None => {
-                    return Json(ConnectResponse {
-                        success: false,
-                        message: "URL required for Alpaca connection".to_string(),
-                    });
-                }
-            };
-            let device_number = request.device_number.unwrap_or(0);
-            
-            tracing::info!("Connecting to Alpaca telescope at {} device {}", url, device_number);
-            TelescopeConnection::Alpaca { url, device_number }
-        }
-        "local" => {
-            let prog_id = match request.prog_id {
-                Some(prog_id) => prog_id,
-                None => {
-                    return Json(ConnectResponse {
-                        success: false,
-                        message: "ProgID required for local connection".to_string(),
-                    });
-                }
-            };
-            
-            tracing::info!("Connecting to local ASCOM telescope: {}", prog_id);
-            TelescopeConnection::Local { prog_id }
-        }
-        _ => {
-            return Json(ConnectResponse {
-                success: false,
-                message: "Invalid connection type. Use 'alpaca' or 'local'".to_string(),
-            });
-        }
-    };
-    
-    let mut client = TelescopeClient::new(connection);
-    
-    // Test connection
-    match client.connect().await {
-        Ok(()) => {
-            // Store the client
-            let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-            if let Ok(mut current_client) = client_mutex.lock() {
-                *current_client = Some(client);
-            }
-            
-            // Update device state
-            {
-                let mut device_state = state.write().await;
-                device_state.telescope_connected = true;
-            }
-            
-            // Start telescope status monitoring
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                telescope_status_monitor(state_clone).await;
-            });
-            
-            Json(ConnectResponse {
-                success: true,
-                message: "Connected to telescope".to_string(),
-            })
-        }
-        Err(e) => {
-            Json(ConnectResponse {
-                success: false,
-                message: format!("Failed to connect to telescope: {}", e),
-            })
-        }
-    }
-}
-
-async fn api_telescope_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Disconnecting from telescope");
-    
-    // Get client and disconnect - using clone pattern to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(mut current_client) = client_mutex.lock() {
-            current_client.take()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(mut client) = client_option {
-        client.disconnect().await
-    } else {
-        Ok(())
-    };
-    
-    // Update device state
-    {
-        let mut device_state = state.write().await;
-        device_state.telescope_connected = false;
-        device_state.telescope_url = None;
-    }
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Disconnected from telescope".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Error disconnecting: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_slew(
+async fn api_send_command(
     State(_state): State<SharedState>,
-    ExtractJson(request): ExtractJson<SlewRequest>,
-) -> Json<ConnectResponse> {
-    tracing::info!("Slewing telescope to RA: {}, Dec: {}", request.ra, request.dec);
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.slew_to_coordinates(request.ra, request.dec).await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: format!("Slewing to RA: {}, Dec: {}", request.ra, request.dec),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Slew failed: {}", e),
-        }),
-    }
+    ExtractJson(request): ExtractJson<CommandRequest>,
+) -> Json<CommandResponse> {
+    // TODO: Implement command sending
+    // This will require refactoring the serial client to expose a command channel
+    Json(CommandResponse {
+        success: false,
+        command: request.command,
+        response: None,
+        message: "Command sending not yet implemented - will be added in next update".to_string(),
+    })
 }
 
-async fn api_telescope_manual_slew(
-    State(_state): State<SharedState>,
-    ExtractJson(request): ExtractJson<ManualSlewRequest>,
-) -> Json<ConnectResponse> {
-    let direction = match request.direction.to_lowercase().as_str() {
-        "north" => SlewDirection::North,
-        "south" => SlewDirection::South,
-        "east" => SlewDirection::East,
-        "west" => SlewDirection::West,
-        _ => {
-            return Json(ConnectResponse {
-                success: false,
-                message: "Invalid direction. Use: north, south, east, or west".to_string(),
-            });
-        }
-    };
-    
-    let rate = request.rate.unwrap_or(1.0); // Default 1 degree/second
-    
-    tracing::info!("Manual slew {:?} at rate {}", direction, rate);
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.move_axis(direction, rate).await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: format!("Moving {:?} at {} deg/s", direction, rate),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Manual slew failed: {}", e),
-        }),
-    }
+async fn api_calibrate(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    // TODO: Send calibration command (06)
+    Json(ConnectResponse {
+        success: false,
+        message: "Calibration command not yet implemented - will be added in next update".to_string(),
+    })
 }
 
-async fn api_telescope_stop_slew(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Stopping all telescope movement");
-    
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.stop_all_movement().await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "All telescope movement stopped".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Stop failed: {}", e),
-        }),
-    }
+async fn api_set_park(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    // TODO: Send set park command (04 or 0D)
+    Json(ConnectResponse {
+        success: false,
+        message: "Set park command not yet implemented - will be added in next update".to_string(),
+    })
 }
 
-async fn api_telescope_axis_rates(State(_state): State<SharedState>) -> Json<serde_json::Value> {
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let rates = if let Some(client) = client_option {
-        client.get_axis_rates().await.unwrap_or_else(|_| vec![0.5, 1.0, 2.0, 4.0])
-    } else {
-        vec![0.5, 1.0, 2.0, 4.0] // Default rates
-    };
-    
-    Json(serde_json::json!({
-        "rates": rates
-    }))
-}
-
-async fn api_telescope_abort(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Aborting telescope slew");
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.abort_slew().await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Slew aborted".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Abort failed: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_tracking(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Toggling telescope tracking");
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        // Get current tracking state and toggle it
-        match client.get_status().await {
-            Ok(status) => client.set_tracking(!status.tracking).await,
-            Err(e) => Err(e),
-        }
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Tracking toggled".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Tracking toggle failed: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_park(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Parking telescope");
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.park().await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Telescope parking".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Park failed: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_unpark(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Unparking telescope");
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.unpark().await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Telescope unparking".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Unpark failed: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_home(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    tracing::info!("Finding telescope home");
-    
-    // Get a clone of the client to avoid holding guard across await
-    let client_option = {
-        let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-        if let Ok(current_client) = client_mutex.lock() {
-            current_client.as_ref().cloned()
-        } else {
-            None
-        }
-    };
-    
-    let result = if let Some(client) = client_option {
-        client.find_home().await
-    } else {
-        Err("No telescope connected".into())
-    };
-    
-    match result {
-        Ok(()) => Json(ConnectResponse {
-            success: true,
-            message: "Telescope finding home".to_string(),
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Find home failed: {}", e),
-        }),
-    }
-}
-
-async fn api_telescope_list() -> Json<TelescopeListResponse> {
-    match crate::telescope_client::discover_local_ascom_telescopes() {
-        Ok(telescopes) => {
-            tracing::info!("Found {} local ASCOM telescopes", telescopes.len());
-            Json(TelescopeListResponse { telescopes })
-        }
-        Err(e) => {
-            tracing::warn!("Failed to discover local telescopes: {}", e);
-            Json(TelescopeListResponse { telescopes: vec![] })
-        }
-    }
-}
-
-// Telescope status monitoring background task
-async fn telescope_status_monitor(device_state: SharedState) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
-    
-    loop {
-        interval.tick().await;
-        
-        // Get the client outside the async block to avoid holding the mutex across await
-        let client_option = {
-            let client_mutex = TELESCOPE_CLIENT.get_or_init(|| Mutex::new(None));
-            if let Ok(current_client) = client_mutex.lock() {
-                current_client.as_ref().cloned()
-            } else {
-                None
-            }
-        };
-        
-        if let Some(client) = client_option {
-            match client.get_status().await {
-                Ok(telescope_status) => {
-                    let mut state = device_state.write().await;
-                    state.telescope_status = telescope_status;
-                    state.update_timestamp();
-                }
-                Err(_) => {
-                    // Lost connection to telescope
-                    let mut state = device_state.write().await;
-                    if state.telescope_connected {
-                        state.telescope_connected = false;
-                        tracing::warn!("Lost connection to telescope");
-                    }
-                    break;
-                }
-            }
-        } else {
-            // No telescope client available
-            let mut state = device_state.write().await;
-            if state.telescope_connected {
-                state.telescope_connected = false;
-                tracing::warn!("Telescope client not available");
-            }
-            break;
-        }
-    }
+async fn api_factory_reset(State(_state): State<SharedState>) -> Json<ConnectResponse> {
+    // TODO: Send factory reset command (0E)
+    Json(ConnectResponse {
+        success: false,
+        message: "Factory reset command not yet implemented - will be added in next update".to_string(),
+    })
 }
 
 // ASCOM Management API handlers
@@ -751,10 +302,10 @@ async fn management_api_versions(Query(query): Query<AlpacaQuery>) -> Json<Alpac
 
 async fn management_configured_devices(Query(query): Query<AlpacaQuery>) -> Json<AlpacaResponse<Vec<HashMap<String, serde_json::Value>>>> {
     let mut device = HashMap::new();
-    device.insert("DeviceName".to_string(), serde_json::Value::String("Telescope Park Sensor".to_string()));
+    device.insert("DeviceName".to_string(), serde_json::Value::String("nRF52840 Telescope Park Sensor".to_string()));
     device.insert("DeviceType".to_string(), serde_json::Value::String("SafetyMonitor".to_string()));
     device.insert("DeviceNumber".to_string(), serde_json::Value::Number(serde_json::Number::from(0)));
-    device.insert("UniqueID".to_string(), serde_json::Value::String("telescope-park-bridge-0".to_string()));
+    device.insert("UniqueID".to_string(), serde_json::Value::String("nrf52840-park-sensor-0".to_string()));
     
     Json(AlpacaResponse::success(
         vec![device],
@@ -765,7 +316,7 @@ async fn management_configured_devices(Query(query): Query<AlpacaQuery>) -> Json
 
 async fn management_description(Query(query): Query<AlpacaQuery>) -> Json<AlpacaResponse<HashMap<String, String>>> {
     let mut description = HashMap::new();
-    description.insert("ServerName".to_string(), "Telescope Park Bridge".to_string());
+    description.insert("ServerName".to_string(), "nRF52840 Telescope Park Bridge".to_string());
     description.insert("Manufacturer".to_string(), "Corey Smart".to_string());
     description.insert("ManufacturerVersion".to_string(), env!("CARGO_PKG_VERSION").to_string());
     description.insert("Location".to_string(), "Local".to_string());
@@ -817,7 +368,7 @@ async fn get_description(
     }
     
     Json(AlpacaResponse::success(
-        "ESP32 Based Custom Position Sensor for Telescope Park Detection".to_string(),
+        "nRF52840 XIAO Sense Based Telescope Park Position Sensor with Built-in IMU".to_string(),
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -839,7 +390,7 @@ async fn get_driver_info(
     }
     
     let device_state = state.read().await;
-    let driver_info = format!("Telescope Park Bridge v{} for {}", 
+    let driver_info = format!("nRF52840 Telescope Park Bridge v{} for {}", 
         env!("CARGO_PKG_VERSION"), 
         device_state.device_name
     );
@@ -961,7 +512,7 @@ async fn get_is_safe(
             query.client_transaction_id.unwrap_or(0),
             next_server_transaction_id(),
             0x407,
-            "Device not connected".to_string(),
+            "nRF52840 device not connected".to_string(),
         ));
     }
     
@@ -972,7 +523,7 @@ async fn get_is_safe(
             query.client_transaction_id.unwrap_or(0),
             next_server_transaction_id(),
             0x408,
-            "Device data is stale".to_string(),
+            "nRF52840 device data is stale".to_string(),
         ));
     }
     
