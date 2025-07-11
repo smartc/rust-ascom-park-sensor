@@ -1,9 +1,9 @@
 use crate::device_state::DeviceState;
 use axum::{
     extract::{Path, Query, State},
-    response::{Html, Json},
+    response::Html,
     routing::{get, post},
-    Router, Json as ExtractJson,
+    Router, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,18 +14,14 @@ use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use tokio_util::sync::CancellationToken;
+
 // Global to track the current serial connection task and cancellation
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use tokio_util::sync::CancellationToken;
 
 static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 static SERIAL_CANCELLATION: OnceLock<Mutex<Option<CancellationToken>>> = OnceLock::new();
-
-// Helper function to get the cancellation token
-pub fn get_serial_cancellation() -> &'static Mutex<Option<CancellationToken>> {
-    SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None))
-}
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
@@ -129,8 +125,16 @@ fn create_router(device_state: SharedState) -> Router {
         .route("/", get(web_interface))
         .route("/api/status", get(api_status))
         .route("/api/ports", get(api_ports))
-        .route("/api/connect", post(api_connect))
-        .route("/api/disconnect", post(api_disconnect))
+        .route("/api/connect", post({
+            |State(state): State<SharedState>, Json(request): Json<ConnectRequest>| async move {
+                api_connect(state, request).await
+            }
+        }))
+        .route("/api/disconnect", post({
+            |State(state): State<SharedState>| async move {
+                api_disconnect(state).await
+            }
+        }))
         .route("/api/command", post(api_send_command))
         
         // Device control routes
@@ -188,40 +192,57 @@ async fn api_ports() -> Json<PortListResponse> {
     }
 }
 
-async fn api_connect(
-    State(state): State<SharedState>,
-    ExtractJson(request): ExtractJson<ConnectRequest>,
-) -> Json<ConnectResponse> {
+async fn api_connect(state: SharedState, request: ConnectRequest) -> Json<ConnectResponse> {
     let baud_rate = request.baud_rate.unwrap_or(115200);
     
-    // Abort any existing serial task
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_task) = task_mutex.lock() {
-        if let Some(task) = current_task.take() {
-            info!("Aborting existing serial task");
-            task.abort();
+    // Cancel and abort any existing connection
+    let cancel_mutex = SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None));
+    if let Ok(mut current_cancel) = cancel_mutex.lock() {
+        if let Some(cancel_token) = current_cancel.take() {
+            cancel_token.cancel();
         }
     }
     
-    // Wait a moment for cleanup
+    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
+    let task_to_abort = {
+        if let Ok(mut current_task) = task_mutex.lock() {
+            current_task.take()
+        } else {
+            None
+        }
+    };
+    
+    if let Some(task) = task_to_abort {
+        info!("Aborting existing serial task");
+        task.abort();
+        match tokio::time::timeout(Duration::from_millis(1000), task).await {
+            Ok(_) => info!("Previous serial task stopped cleanly"),
+            Err(_) => info!("Previous serial task abort timed out"),
+        }
+    }
+    
     tokio::time::sleep(Duration::from_millis(100)).await;
     
-    // Start a new serial connection task
+    // Create new cancellation token
+    let cancel_token = CancellationToken::new();
+    if let Ok(mut current_cancel) = cancel_mutex.lock() {
+        *current_cancel = Some(cancel_token.clone());
+    }
+    
+    // Start new serial connection task with cancellation
     let device_state_clone = state.clone();
     let port = request.port.clone();
     
     let new_task = tokio::spawn(async move {
-        if let Err(e) = crate::serial_client::run_serial_client(port, baud_rate, device_state_clone).await {
+        if let Err(e) = crate::serial_client::run_serial_client_with_cancellation(port, baud_rate, device_state_clone, cancel_token).await {
             tracing::error!("Serial client error: {}", e);
         }
     });
     
-    // Store the new task
     if let Ok(mut current_task) = task_mutex.lock() {
         *current_task = Some(new_task);
     }
     
-    // Update the device state to show the selected port
     {
         let mut device_state = state.write().await;
         device_state.serial_port = Some(request.port.clone());
@@ -234,25 +255,39 @@ async fn api_connect(
     })
 }
 
-async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectResponse> {
+async fn api_disconnect(state: SharedState) -> Json<ConnectResponse> {
     info!("Disconnecting from nRF52840 device");
     
-    // Abort the task - this should stop all async operations immediately
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_task) = task_mutex.lock() {
-        if let Some(task) = current_task.take() {
-            info!("Aborting serial task");
-            task.abort();
-            
-            // Wait for the task to actually stop
-            match tokio::time::timeout(Duration::from_millis(1000), task).await {
-                Ok(_) => info!("Serial task stopped cleanly"),
-                Err(_) => info!("Serial task abort timed out (this is normal)"),
-            }
+    // Cancel the serial operation first
+    let cancel_mutex = SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None));
+    if let Ok(mut current_cancel) = cancel_mutex.lock() {
+        if let Some(cancel_token) = current_cancel.take() {
+            info!("Cancelling serial operations");
+            cancel_token.cancel();
         }
     }
     
-    // Force update device state to disconnected
+    // Then abort the task
+    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
+    let task_to_abort = {
+        if let Ok(mut current_task) = task_mutex.lock() {
+            current_task.take()
+        } else {
+            None
+        }
+    };
+    
+    if let Some(task) = task_to_abort {
+        info!("Aborting serial task");
+        task.abort();
+        match tokio::time::timeout(Duration::from_millis(2000), task).await {
+            Ok(_) => info!("Serial task stopped cleanly"),
+            Err(_) => info!("Serial task abort timed out"),
+        }
+    }
+    
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    
     {
         let mut device_state = state.write().await;
         device_state.connected = false;
@@ -260,18 +295,15 @@ async fn api_disconnect(State(state): State<SharedState>) -> Json<ConnectRespons
         device_state.clear_error();
     }
     
-    info!("Device marked as disconnected");
+    info!("Serial port released and device disconnected");
     
     Json(ConnectResponse {
         success: true,
-        message: "Disconnected from nRF52840 device".to_string(),
+        message: "Disconnected from nRF52840 device and released serial port".to_string(),
     })
 }
 
-async fn api_send_command(
-    State(_state): State<SharedState>,
-    ExtractJson(request): ExtractJson<CommandRequest>,
-) -> Json<CommandResponse> {
+async fn api_send_command(State(_state): State<SharedState>, Json(request): Json<CommandRequest>) -> Json<CommandResponse> {
     // TODO: Implement command sending
     // This will require refactoring the serial client to expose a command channel
     Json(CommandResponse {
