@@ -9,10 +9,12 @@ mod alpaca_server;
 mod device_state;
 mod errors;
 mod port_discovery;
+mod connection_manager;
 
 use crate::device_state::DeviceState;
 use crate::alpaca_server::create_alpaca_server;
 use crate::port_discovery::discover_ports;
+use crate::connection_manager::ConnectionManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "telescope_park_bridge")]
@@ -35,7 +37,7 @@ struct Args {
     #[arg(long, default_value = "11111")]
     http_port: u16,
     
-    /// Auto-select first available nRF52840-like device
+    /// Auto-select first available nRF52840-like device and connect
     #[arg(long)]
     auto: bool,
     
@@ -57,8 +59,14 @@ async fn main() -> Result<()> {
     info!("Starting Telescope Park Bridge v0.3.0");
     info!("Target device: nRF52840 XIAO Sense with built-in IMU");
     
-    // Handle port selection
-    let serial_port = if let Some(port) = args.port {
+    // Create shared device state
+    let device_state = Arc::new(RwLock::new(DeviceState::new()));
+    
+    // Create connection manager
+    let connection_manager = Arc::new(ConnectionManager::new(device_state.clone()));
+    
+    // Handle port selection and auto-connection
+    let target_port = if let Some(port) = args.port {
         info!("Using specified port: {}", port);
         Some(port)
     } else if args.auto {
@@ -93,76 +101,57 @@ async fn main() -> Result<()> {
             Err(_) => None,
         }
     } else {
-        info!("Starting in web-only mode - use web interface to select serial port");
         None
     };
     
-    if let Some(port) = &serial_port {
-        info!("Using serial port: {}", port);
+    // Auto-connect if we have a target port
+    if let Some(port) = target_port {
+        info!("Auto-connecting to: {}", port);
+        match connection_manager.connect(port.clone(), args.baud).await {
+            Ok(message) => info!("Auto-connect: {}", message),
+            Err(e) => error!("Auto-connect failed: {}", e),
+        }
     } else {
-        info!("No serial port selected - running in web-only mode");
+        info!("No port specified - use web interface to select and connect");
     }
     
-    // Create shared device state
-    let device_state = Arc::new(RwLock::new(DeviceState::new()));
-    
-    // Start the ASCOM Alpaca server
+    // Start the ASCOM Alpaca server with the connection manager
     let server_handle = tokio::spawn(create_alpaca_server(
         args.bind.clone(),
         args.http_port,
         device_state.clone(),
+        connection_manager.clone(),
     ));
-    
-    // Start serial communication if port was selected
-    let serial_handle = if let Some(port) = serial_port {
-        // Don't create cancellation token here - let the web interface manage it
-        Some(tokio::spawn(serial_client::run_serial_client(
-            port,
-            args.baud,
-            device_state.clone(),
-        )))
-    } else {
-        None
-    };
     
     info!("Bridge running at http://{}:{}", args.bind, args.http_port);
     info!("Web interface: http://{}:{}/", args.bind, args.http_port);
     info!("ASCOM Alpaca endpoint: http://{}:{}/api/v1/safetymonitor/0/", args.bind, args.http_port);
     
-    if serial_handle.is_none() {
-        info!("Running in web-only mode - use web interface to connect to serial device");
+    if connection_manager.is_connected().await {
+        if let Some(current_port) = connection_manager.get_current_port().await {
+            info!("Connected to: {}", current_port);
+        }
+    } else {
+        info!("Use the web interface to connect to your nRF52840 device");
     }
     
     info!("Press Ctrl+C to stop");
     
-    // Wait for either task to complete (or fail)
-    match serial_handle {
-        Some(handle) => {
-            tokio::select! {
-                result = server_handle => {
-                    if let Err(e) = result {
-                        error!("Server error: {}", e);
-                    }
-                }
-                result = handle => {
-                    if let Err(e) = result {
-                        error!("Serial client error: {}", e);
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, shutting down...");
-                }
+    // Wait for server or Ctrl+C
+    tokio::select! {
+        result = server_handle => {
+            if let Err(e) = result {
+                error!("Server error: {}", e);
             }
         }
-        None => {
-            tokio::select! {
-                result = server_handle => {
-                    if let Err(e) = result {
-                        error!("Server error: {}", e);
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, shutting down...");
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down...");
+            
+            // Gracefully disconnect
+            if connection_manager.is_connected().await {
+                info!("Disconnecting from device...");
+                if let Err(e) = connection_manager.disconnect().await {
+                    error!("Error during shutdown disconnect: {}", e);
                 }
             }
         }

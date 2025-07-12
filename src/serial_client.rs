@@ -1,3 +1,10 @@
+// Serial client for nRF52840 device communication
+// Optimized for real-time updates with reduced debug noise:
+// - Position polling: every 1 second 
+// - Status polling: every 2 seconds
+// - Debug messages: reduced frequency to minimize log noise
+// - Park status changes: always logged as INFO level
+
 use crate::device_state::{DeviceState, FirmwareResponse, StatusResponse, PositionResponse, ParkStatusResponse};
 use crate::errors::{BridgeError, Result};
 use std::sync::Arc;
@@ -121,8 +128,13 @@ async fn connect_and_monitor_with_cancellation(
         state.clear_error();
     }
     
-    let mut status_interval = interval(Duration::from_secs(10));
-    let mut position_interval = interval(Duration::from_secs(3));
+    // FASTER POLLING INTERVALS for more real-time updates
+    let mut status_interval = interval(Duration::from_secs(2));    // Device status every 2 seconds
+    let mut position_interval = interval(Duration::from_secs(1));  // Park position every 1 second
+    
+    // Debug counters to reduce log noise
+    let mut status_poll_count = 0u32;
+    let mut position_poll_count = 0u32;
     
     info!("Sending initial status query to nRF52840");
     if let Err(e) = send_command(&mut writer, "01").await {
@@ -144,7 +156,14 @@ async fn connect_and_monitor_with_cancellation(
                         }
                     }
                     Err(BridgeError::Timeout) => {
-                        debug!("No response from device (timeout)");
+                        // Only log timeouts occasionally to reduce noise
+                        static mut TIMEOUT_COUNT: u32 = 0;
+                        unsafe {
+                            TIMEOUT_COUNT += 1;
+                            if TIMEOUT_COUNT % 20 == 0 {
+                                debug!("No response from device (timeout) - cycle {}", TIMEOUT_COUNT);
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Error reading from serial: {}", e);
@@ -154,7 +173,11 @@ async fn connect_and_monitor_with_cancellation(
             }
             
             _ = status_interval.tick() => {
-                debug!("Polling device status");
+                status_poll_count += 1;
+                // Only log every 5th status poll (every 10 seconds) to reduce noise
+                if status_poll_count % 5 == 0 {
+                    debug!("Polling device status (cycle {})", status_poll_count);
+                }
                 if let Err(e) = send_command(&mut writer, "01").await {
                     error!("Error sending status check: {}", e);
                     break;
@@ -162,7 +185,11 @@ async fn connect_and_monitor_with_cancellation(
             }
             
             _ = position_interval.tick() => {
-                debug!("Polling park status");
+                position_poll_count += 1;
+                // Only log every 10th position poll (every 10 seconds) to reduce noise
+                if position_poll_count % 10 == 0 {
+                    debug!("Polling park status (cycle {})", position_poll_count);
+                }
                 if let Err(e) = send_command(&mut writer, "03").await {
                     error!("Error sending park status check: {}", e);
                     break;
@@ -188,7 +215,15 @@ async fn connect_and_monitor_with_cancellation(
 
 async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStream>, command: &str) -> Result<()> {
     let command_str = format!("<{}>\n", command);
-    debug!("Sending command to nRF52840: {}", command_str.trim());
+    
+    // Reduce debug noise for command sending - only log every 20th command
+    static mut COMMAND_COUNT: u32 = 0;
+    unsafe {
+        COMMAND_COUNT += 1;
+        if COMMAND_COUNT % 20 == 0 {
+            debug!("Sending command to nRF52840: {} (cycle {})", command_str.trim(), COMMAND_COUNT);
+        }
+    }
     
     writer.write_all(command_str.as_bytes()).await?;
     writer.flush().await?;
@@ -210,7 +245,14 @@ async fn read_response(reader: &mut BufReader<tokio::io::ReadHalf<tokio_serial::
             
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                debug!("Received from nRF52840: {}", trimmed);
+                // Reduce debug noise for received messages - only log every 20th response
+                static mut RECEIVE_COUNT: u32 = 0;
+                unsafe {
+                    RECEIVE_COUNT += 1;
+                    if RECEIVE_COUNT % 20 == 0 {
+                        debug!("Received from nRF52840: {} (cycle {})", trimmed, RECEIVE_COUNT);
+                    }
+                }
             }
             Ok(trimmed.to_string())
         }
@@ -243,8 +285,15 @@ async fn process_response(response: String, device_state: Arc<RwLock<DeviceState
         }
     };
     
-    debug!("Parsed firmware response: status={}, has_data={}", 
-           parsed.status, parsed.data.is_some());
+    // Reduce debug noise - only log parsed responses occasionally
+    static mut RESPONSE_COUNT: u32 = 0;
+    unsafe {
+        RESPONSE_COUNT += 1;
+        if RESPONSE_COUNT % 20 == 0 {
+            debug!("Parsed firmware response: status={}, has_data={} (cycle {})", 
+                   parsed.status, parsed.data.is_some(), RESPONSE_COUNT);
+        }
+    }
     
     match parsed.status.as_str() {
         "ok" => {
@@ -253,8 +302,13 @@ async fn process_response(response: String, device_state: Arc<RwLock<DeviceState
             }
         }
         "ack" => {
+            // Reduce ACK message noise - only log occasionally
             if let Some(command) = parsed.command {
-                debug!("Command {} acknowledged by nRF52840", command);
+                unsafe {
+                    if RESPONSE_COUNT % 20 == 0 {
+                        debug!("Command {} acknowledged by nRF52840 (recent acks logged)", command);
+                    }
+                }
             }
         }
         "error" => {
@@ -278,23 +332,53 @@ async fn update_device_state_from_data(
 ) -> Result<()> {
     let mut state = device_state.write().await;
     
+    // Static counter to reduce debug noise
+    static mut UPDATE_COUNT: u32 = 0;
+    unsafe { UPDATE_COUNT += 1; }
+    
     if let Ok(status_data) = serde_json::from_value::<StatusResponse>(data.clone()) {
-        debug!("Updating device status from nRF52840: parked={}, calibrated={}", 
-               status_data.parked, status_data.calibrated);
+        // Only log status updates every 10th time (every ~20 seconds)
+        unsafe {
+            if UPDATE_COUNT % 10 == 0 {
+                debug!("Updating device status from nRF52840: parked={}, calibrated={} (cycle {})", 
+                       status_data.parked, status_data.calibrated, UPDATE_COUNT);
+            }
+        }
         state.update_from_status(&status_data);
         return Ok(());
     }
     
     if let Ok(position_data) = serde_json::from_value::<PositionResponse>(data.clone()) {
-        debug!("Updating position from nRF52840: pitch={:.2}, roll={:.2}", 
-               position_data.pitch, position_data.roll);
+        // Only log position updates every 20th time (every ~20 seconds)
+        unsafe {
+            if UPDATE_COUNT % 20 == 0 {
+                debug!("Updating position from nRF52840: pitch={:.2}, roll={:.2} (cycle {})", 
+                       position_data.pitch, position_data.roll, UPDATE_COUNT);
+            }
+        }
         state.update_from_position(&position_data);
         return Ok(());
     }
     
     if let Ok(park_data) = serde_json::from_value::<ParkStatusResponse>(data.clone()) {
-        debug!("Updating park status from nRF52840: parked={}, pitch={:.2}, roll={:.2}", 
-               park_data.parked, park_data.current_pitch, park_data.current_roll);
+        // Always log park status changes (important events), log periodic updates less frequently
+        let was_parked = state.is_parked;
+        let now_parked = park_data.parked;
+        
+        if was_parked != now_parked {
+            info!("Park status CHANGED: {} -> {} at pitch={:.2}°, roll={:.2}°", 
+                  if was_parked { "PARKED" } else { "NOT PARKED" },
+                  if now_parked { "PARKED" } else { "NOT PARKED" },
+                  park_data.current_pitch, park_data.current_roll);
+        } else {
+            unsafe {
+                if UPDATE_COUNT % 20 == 0 {
+                    debug!("Updating park status from nRF52840: parked={}, pitch={:.2}, roll={:.2} (cycle {})", 
+                           park_data.parked, park_data.current_pitch, park_data.current_roll, UPDATE_COUNT);
+                }
+            }
+        }
+        
         state.update_from_park_status(&park_data);
         return Ok(());
     }
@@ -306,6 +390,11 @@ async fn update_device_state_from_data(
         }
     }
     
-    debug!("Unknown data format from nRF52840: {}", data);
+    // Only log unknown data occasionally
+    unsafe {
+        if UPDATE_COUNT % 50 == 0 {
+            debug!("Unknown data format from nRF52840: {}", data);
+        }
+    }
     Ok(())
 }

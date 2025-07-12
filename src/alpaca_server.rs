@@ -1,4 +1,5 @@
 use crate::device_state::DeviceState;
+use crate::connection_manager::ConnectionManager;
 use axum::{
     extract::{Path, Query, State},
     response::Html,
@@ -8,20 +9,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-
-use tokio_util::sync::CancellationToken;
-
-// Global to track the current serial connection task and cancellation
-use std::sync::Mutex;
-use std::sync::OnceLock;
-
-static SERIAL_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-static SERIAL_CANCELLATION: OnceLock<Mutex<Option<CancellationToken>>> = OnceLock::new();
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
@@ -102,13 +92,15 @@ struct CommandResponse {
 }
 
 type SharedState = Arc<RwLock<DeviceState>>;
+type SharedConnectionManager = Arc<ConnectionManager>;
 
 pub async fn create_alpaca_server(
     bind_address: String,
     port: u16,
     device_state: SharedState,
+    connection_manager: SharedConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = create_router(device_state);
+    let app = create_router(device_state, connection_manager);
     
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_address, port)).await?;
     
@@ -119,22 +111,14 @@ pub async fn create_alpaca_server(
     Ok(())
 }
 
-fn create_router(device_state: SharedState) -> Router {
+fn create_router(device_state: SharedState, connection_manager: SharedConnectionManager) -> Router {
     Router::new()
         // Web interface routes
         .route("/", get(web_interface))
         .route("/api/status", get(api_status))
         .route("/api/ports", get(api_ports))
-        .route("/api/connect", post({
-            |State(state): State<SharedState>, Json(request): Json<ConnectRequest>| async move {
-                api_connect(state, request).await
-            }
-        }))
-        .route("/api/disconnect", post({
-            |State(state): State<SharedState>| async move {
-                api_disconnect(state).await
-            }
-        }))
+        .route("/api/connect", post(api_connect))
+        .route("/api/disconnect", post(api_disconnect))
         .route("/api/command", post(api_send_command))
         
         // Device control routes
@@ -159,8 +143,10 @@ fn create_router(device_state: SharedState) -> Router {
         .route("/api/v1/safetymonitor/:device_number/issafe", get(get_is_safe))
         
         .layer(CorsLayer::permissive())
-        .with_state(device_state)
+        .with_state((device_state, connection_manager))
 }
+
+type AppState = (SharedState, SharedConnectionManager);
 
 static mut SERVER_TRANSACTION_ID: u32 = 0;
 
@@ -180,8 +166,8 @@ async fn web_interface() -> Html<String> {
     Html(html)
 }
 
-async fn api_status(State(state): State<SharedState>) -> Json<DeviceState> {
-    let device_state = state.read().await;
+async fn api_status(State((device_state, _)): State<AppState>) -> Json<DeviceState> {
+    let device_state = device_state.read().await;
     Json(device_state.clone())
 }
 
@@ -192,120 +178,40 @@ async fn api_ports() -> Json<PortListResponse> {
     }
 }
 
-async fn api_connect(state: SharedState, request: ConnectRequest) -> Json<ConnectResponse> {
+async fn api_connect(
+    State((_, connection_manager)): State<AppState>,
+    Json(request): Json<ConnectRequest>,
+) -> Json<ConnectResponse> {
     let baud_rate = request.baud_rate.unwrap_or(115200);
     
-    // Cancel and abort any existing connection
-    let cancel_mutex = SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_cancel) = cancel_mutex.lock() {
-        if let Some(cancel_token) = current_cancel.take() {
-            cancel_token.cancel();
-        }
+    match connection_manager.connect(request.port, baud_rate).await {
+        Ok(message) => Json(ConnectResponse {
+            success: true,
+            message,
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Connection failed: {}", e),
+        }),
     }
-    
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    let task_to_abort = {
-        if let Ok(mut current_task) = task_mutex.lock() {
-            current_task.take()
-        } else {
-            None
-        }
-    };
-    
-    if let Some(task) = task_to_abort {
-        info!("Aborting existing serial task");
-        task.abort();
-        match tokio::time::timeout(Duration::from_millis(1000), task).await {
-            Ok(_) => info!("Previous serial task stopped cleanly"),
-            Err(_) => info!("Previous serial task abort timed out"),
-        }
-    }
-    
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // Create new cancellation token
-    let cancel_token = CancellationToken::new();
-    if let Ok(mut current_cancel) = cancel_mutex.lock() {
-        *current_cancel = Some(cancel_token.clone());
-    }
-    
-    // Start new serial connection task with cancellation
-    let device_state_clone = state.clone();
-    let port = request.port.clone();
-    
-    let new_task = tokio::spawn(async move {
-        if let Err(e) = crate::serial_client::run_serial_client_with_cancellation(port, baud_rate, device_state_clone, cancel_token).await {
-            tracing::error!("Serial client error: {}", e);
-        }
-    });
-    
-    if let Ok(mut current_task) = task_mutex.lock() {
-        *current_task = Some(new_task);
-    }
-    
-    {
-        let mut device_state = state.write().await;
-        device_state.serial_port = Some(request.port.clone());
-        device_state.clear_error();
-    }
-    
-    Json(ConnectResponse {
-        success: true,
-        message: format!("Connecting to nRF52840 device on {} at {} baud", request.port, baud_rate),
-    })
 }
 
-async fn api_disconnect(state: SharedState) -> Json<ConnectResponse> {
-    info!("Disconnecting from nRF52840 device");
-    
-    // Cancel the serial operation first
-    let cancel_mutex = SERIAL_CANCELLATION.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current_cancel) = cancel_mutex.lock() {
-        if let Some(cancel_token) = current_cancel.take() {
-            info!("Cancelling serial operations");
-            cancel_token.cancel();
-        }
+async fn api_disconnect(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
+    match connection_manager.disconnect().await {
+        Ok(message) => Json(ConnectResponse {
+            success: true,
+            message,
+        }),
+        Err(e) => Json(ConnectResponse {
+            success: false,
+            message: format!("Disconnect failed: {}", e),
+        }),
     }
-    
-    // Then abort the task
-    let task_mutex = SERIAL_TASK.get_or_init(|| Mutex::new(None));
-    let task_to_abort = {
-        if let Ok(mut current_task) = task_mutex.lock() {
-            current_task.take()
-        } else {
-            None
-        }
-    };
-    
-    if let Some(task) = task_to_abort {
-        info!("Aborting serial task");
-        task.abort();
-        match tokio::time::timeout(Duration::from_millis(2000), task).await {
-            Ok(_) => info!("Serial task stopped cleanly"),
-            Err(_) => info!("Serial task abort timed out"),
-        }
-    }
-    
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
-    {
-        let mut device_state = state.write().await;
-        device_state.connected = false;
-        device_state.serial_port = None;
-        device_state.clear_error();
-    }
-    
-    info!("Serial port released and device disconnected");
-    
-    Json(ConnectResponse {
-        success: true,
-        message: "Disconnected from nRF52840 device and released serial port".to_string(),
-    })
 }
 
-async fn api_send_command(State(_state): State<SharedState>, Json(request): Json<CommandRequest>) -> Json<CommandResponse> {
-    // TODO: Implement command sending
-    // This will require refactoring the serial client to expose a command channel
+async fn api_send_command(State(_): State<AppState>, Json(request): Json<CommandRequest>) -> Json<CommandResponse> {
+    // TODO: Implement command sending through connection manager
+    // This will require extending the connection manager to support command sending
     Json(CommandResponse {
         success: false,
         command: request.command,
@@ -314,24 +220,24 @@ async fn api_send_command(State(_state): State<SharedState>, Json(request): Json
     })
 }
 
-async fn api_calibrate(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send calibration command (06)
+async fn api_calibrate(State(_): State<AppState>) -> Json<ConnectResponse> {
+    // TODO: Send calibration command (06) through connection manager
     Json(ConnectResponse {
         success: false,
         message: "Calibration command not yet implemented - will be added in next update".to_string(),
     })
 }
 
-async fn api_set_park(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send set park command (04 or 0D)
+async fn api_set_park(State(_): State<AppState>) -> Json<ConnectResponse> {
+    // TODO: Send set park command (04 or 0D) through connection manager
     Json(ConnectResponse {
         success: false,
         message: "Set park command not yet implemented - will be added in next update".to_string(),
     })
 }
 
-async fn api_factory_reset(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // TODO: Send factory reset command (0E)
+async fn api_factory_reset(State(_): State<AppState>) -> Json<ConnectResponse> {
+    // TODO: Send factory reset command (0E) through connection manager
     Json(ConnectResponse {
         success: false,
         message: "Factory reset command not yet implemented - will be added in next update".to_string(),
@@ -379,7 +285,7 @@ async fn management_description(Query(query): Query<AlpacaQuery>) -> Json<Alpaca
 async fn get_connected(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State((_, connection_manager)): State<AppState>,
 ) -> Json<AlpacaResponse<bool>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -391,9 +297,9 @@ async fn get_connected(
         ));
     }
     
-    let device_state = state.read().await;
+    let connected = connection_manager.is_connected().await;
     Json(AlpacaResponse::success(
-        device_state.connected,
+        connected,
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -402,7 +308,7 @@ async fn get_connected(
 async fn get_description(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(_state): State<SharedState>,
+    State(_): State<AppState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -424,7 +330,7 @@ async fn get_description(
 async fn get_driver_info(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State((device_state, _)): State<AppState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -436,7 +342,7 @@ async fn get_driver_info(
         ));
     }
     
-    let device_state = state.read().await;
+    let device_state = device_state.read().await;
     let driver_info = format!("nRF52840 Telescope Park Bridge v{} for {}", 
         env!("CARGO_PKG_VERSION"), 
         device_state.device_name
@@ -494,7 +400,7 @@ async fn get_interface_version(
 async fn get_name(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State((device_state, _)): State<AppState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -506,7 +412,7 @@ async fn get_name(
         ));
     }
     
-    let device_state = state.read().await;
+    let device_state = device_state.read().await;
     Json(AlpacaResponse::success(
         device_state.device_name.clone(),
         query.client_transaction_id.unwrap_or(0),
@@ -538,7 +444,7 @@ async fn get_supported_actions(
 async fn get_is_safe(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State((device_state, connection_manager)): State<AppState>,
 ) -> Json<AlpacaResponse<bool>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -550,10 +456,8 @@ async fn get_is_safe(
         ));
     }
     
-    let device_state = state.read().await;
-    
-    // If not connected, it's not safe
-    if !device_state.connected {
+    // Check if connected
+    if !connection_manager.is_connected().await {
         return Json(AlpacaResponse::error(
             false,
             query.client_transaction_id.unwrap_or(0),
@@ -562,6 +466,8 @@ async fn get_is_safe(
             "nRF52840 device not connected".to_string(),
         ));
     }
+    
+    let device_state = device_state.read().await;
     
     // Check if data is recent (within last 30 seconds)
     if !device_state.is_recent(30) {

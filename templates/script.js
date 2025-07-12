@@ -380,11 +380,12 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 });
 
-// Auto-refresh status every 5 seconds
-setInterval(fetchStatus, 5000);
+// Auto-refresh every 1 second for real-time updates
+setInterval(fetchStatus, 1000);
 
 // Initial load
 log('🚀 nRF52840 Telescope Park Bridge v0.3.0 loaded');
 log('🔧 Target device: XIAO Sense with LSM6DS3TR-C IMU');
+log('⚡ Real-time updates: 1 second refresh rate');
 fetchStatus();
 refreshPorts();
