@@ -10,16 +10,18 @@ mod device_state;
 mod errors;
 mod port_discovery;
 mod connection_manager;
+mod discovery_server;
 
 use crate::device_state::DeviceState;
 use crate::alpaca_server::create_alpaca_server;
 use crate::port_discovery::discover_ports;
+use crate::discovery_server::start_discovery_server;
 use crate::connection_manager::ConnectionManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "telescope_park_bridge")]
-#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.4.0")]
-#[command(version = "0.4.0")]
+#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.4.1")]
+#[command(version = "0.4.1")]
 struct Args {
     /// Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)
     #[arg(short, long)]
@@ -30,7 +32,7 @@ struct Args {
     baud: u32,
     
     /// HTTP server bind address
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     bind: String,
     
     /// HTTP server port for ASCOM Alpaca
@@ -127,10 +129,19 @@ async fn main() -> Result<()> {
         info!("No port specified. Use --port, --auto, or web interface to connect.");
     }
     
+    // Start the ASCOM Alpaca discovery server
+    info!("Starting ASCOM Alpaca discovery server...");
+    let discovery_task = tokio::spawn(async move {
+        if let Err(e) = start_discovery_server(args.http_port).await {
+            error!("Discovery server error: {}", e);
+        }
+    });
+    
     // Start the ASCOM Alpaca server
     info!("Starting ASCOM Alpaca server...");
     if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state, connection_manager).await {
         error!("Failed to start ASCOM Alpaca server: {}", e);
+        discovery_task.abort();
         return Err(anyhow::anyhow!("Server error: {}", e));
     }
     
