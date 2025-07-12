@@ -37,6 +37,9 @@ pub struct DeviceState {
     // System info
     pub uptime: u64,
     pub free_heap: u64,
+    
+    // ASCOM client connection state (separate from hardware)
+    pub ascom_connected: bool,
 }
 
 impl Default for DeviceState {
@@ -73,13 +76,16 @@ impl DeviceState {
             is_safe: false,
             is_calibrated: false,
             
-            // Capabilities
+            // Capability defaults
             has_builtin_imu: true,
-            storage_available: false,  // nRF52840 with mbed core has limited storage
+            storage_available: true,
             
             // System defaults
             uptime: 0,
             free_heap: 0,
+            
+            // ASCOM defaults
+            ascom_connected: false,
         }
     }
     
@@ -101,70 +107,37 @@ impl DeviceState {
         self.update_timestamp();
     }
     
-    // NEW METHOD: Reset all state to disconnected defaults
     pub fn reset_to_disconnected(&mut self) {
-        // Connection status
         self.connected = false;
+        self.ascom_connected = false;
         self.serial_port = None;
-        self.clear_error();
-        
-        // Reset device information to disconnected state
-        self.device_name = "Not connected".to_string();
-        self.device_version = "--".to_string();
-        self.manufacturer = "--".to_string();
-        self.platform = "--".to_string();
-        self.imu = "--".to_string();
-        
-        // Reset position data
-        self.current_pitch = 0.0;
-        self.current_roll = 0.0;
-        self.park_pitch = 0.0;
-        self.park_roll = 0.0;
-        self.position_tolerance = 0.0;
-        
-        // Reset status flags
-        self.is_parked = false;
-        self.is_safe = false;
-        self.is_calibrated = false;
-        
-        // Reset system info
-        self.uptime = 0;
-        self.free_heap = 0;
-        
         self.update_timestamp();
     }
     
-    pub fn is_recent(&self, max_age_seconds: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        now.saturating_sub(self.last_update) <= max_age_seconds
-    }
-    
-    // Update device state from firmware status response
     pub fn update_from_status(&mut self, status_data: &StatusResponse) {
         self.device_name = status_data.device_name.clone();
         self.device_version = status_data.version.clone();
         self.manufacturer = status_data.manufacturer.clone();
-        self.platform = status_data.platform.clone().unwrap_or_else(|| "nRF52840".to_string());
-        self.imu = status_data.imu.clone().unwrap_or_else(|| "LSM6DS3TR-C".to_string());
+        if let Some(platform) = &status_data.platform {
+            self.platform = platform.clone();
+        }
+        if let Some(imu) = &status_data.imu {
+            self.imu = imu.clone();
+        }
         self.is_parked = status_data.parked;
         self.is_safe = status_data.parked; // For ASCOM compatibility
         self.is_calibrated = status_data.calibrated;
         self.uptime = status_data.uptime;
+        self.connected = true;
         self.update_timestamp();
     }
     
-    // Update position data from firmware position response
     pub fn update_from_position(&mut self, position_data: &PositionResponse) {
         self.current_pitch = position_data.pitch;
         self.current_roll = position_data.roll;
         self.update_timestamp();
     }
     
-    // Update park status from firmware park response
     pub fn update_from_park_status(&mut self, park_data: &ParkStatusResponse) {
         self.is_parked = park_data.parked;
         self.is_safe = park_data.parked; // For ASCOM compatibility

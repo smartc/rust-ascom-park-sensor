@@ -3,7 +3,7 @@ use crate::connection_manager::ConnectionManager;
 use axum::{
     extract::{Path, Query, State},
     response::Html,
-    routing::{get, post},
+    routing::{get, post, put},
     Router, Json,
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
@@ -131,9 +131,11 @@ fn create_router(device_state: SharedState, connection_manager: SharedConnection
         .route("/management/v1/configureddevices", get(management_configured_devices))
         .route("/management/v1/description", get(management_description))
         
-        // ASCOM Alpaca Safety Monitor API
+        // ASCOM Alpaca Safety Monitor API - Fixed for v0.4.0
         .route("/api/v1/safetymonitor/:device_number/connected", 
                get(get_connected))
+        .route("/api/v1/safetymonitor/:device_number/connected", 
+               put(put_connected_simple))
         .route("/api/v1/safetymonitor/:device_number/description", get(get_description))
         .route("/api/v1/safetymonitor/:device_number/driverinfo", get(get_driver_info))
         .route("/api/v1/safetymonitor/:device_number/driverversion", get(get_driver_version))
@@ -179,163 +181,142 @@ async fn api_ports() -> Json<PortListResponse> {
 }
 
 async fn api_connect(
-    State((_, connection_manager)): State<AppState>,
+    State((_device_state, connection_manager)): State<AppState>,
     Json(request): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
-    let baud_rate = request.baud_rate.unwrap_or(115200);
+    info!("Connecting to port: {}", request.port);
     
-    match connection_manager.connect(request.port, baud_rate).await {
-        Ok(message) => Json(ConnectResponse {
-            success: true,
-            message,
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Connection failed: {}", e),
-        }),
+    match connection_manager.connect(request.port.clone(), request.baud_rate.unwrap_or(115200)).await {
+        Ok(_) => {
+            info!("Successfully connected to {}", request.port);
+            Json(ConnectResponse {
+                success: true,
+                message: format!("Connected to {}", request.port),
+            })
+        }
+        Err(e) => {
+            error!("Failed to connect to {}: {}", request.port, e);
+            Json(ConnectResponse {
+                success: false,
+                message: format!("Failed to connect: {}", e),
+            })
+        }
     }
 }
 
-async fn api_disconnect(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
-    match connection_manager.disconnect().await {
-        Ok(message) => Json(ConnectResponse {
-            success: true,
-            message,
-        }),
-        Err(e) => Json(ConnectResponse {
-            success: false,
-            message: format!("Disconnect failed: {}", e),
-        }),
-    }
+async fn api_disconnect(
+    State((_device_state, connection_manager)): State<AppState>,
+) -> Json<ConnectResponse> {
+    info!("Disconnecting from device");
+    
+    connection_manager.disconnect().await;
+    
+    Json(ConnectResponse {
+        success: true,
+        message: "Disconnected".to_string(),
+    })
 }
 
 async fn api_send_command(
-    State((_, connection_manager)): State<AppState>, 
-    Json(request): Json<CommandRequest>
+    State((_device_state, connection_manager)): State<AppState>,
+    Json(request): Json<CommandRequest>,
 ) -> Json<CommandResponse> {
-    info!("API: Sending manual command: {}", request.command);
+    info!("Sending manual command: {}", request.command);
     
-    if !connection_manager.is_connected().await {
-        return Json(CommandResponse {
-            success: false,
-            command: request.command,
-            response: None,
-            message: "Device not connected".to_string(),
-        });
-    }
-    
-    // Validate command format (should be hex digits only)
-    let command = request.command.trim().to_uppercase();
-    if command.is_empty() || !command.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Json(CommandResponse {
-            success: false,
-            command: request.command,
-            response: None,
-            message: "Invalid command format. Use hex digits only (e.g., 01, 02, 0A050)".to_string(),
-        });
-    }
-    
-    match connection_manager.send_command(&command).await {
+    match connection_manager.send_command(&request.command).await {
         Ok(response) => {
-            info!("Command {} succeeded: {}", command, response);
             Json(CommandResponse {
                 success: true,
-                command: command,
+                command: request.command.clone(),
                 response: Some(response),
                 message: "Command sent successfully".to_string(),
             })
         }
         Err(e) => {
-            error!("Command {} failed: {}", command, e);
+            error!("Failed to send command {}: {}", request.command, e);
             Json(CommandResponse {
                 success: false,
-                command: command,
+                command: request.command.clone(),
                 response: None,
-                message: format!("Command failed: {}", e),
+                message: format!("Failed to send command: {}", e),
             })
         }
     }
 }
 
-async fn api_calibrate(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
-    info!("API: Starting sensor calibration");
+async fn api_calibrate(
+    State((_device_state, connection_manager)): State<AppState>,
+) -> Json<CommandResponse> {
+    info!("Starting sensor calibration");
     
-    if !connection_manager.is_connected().await {
-        return Json(ConnectResponse {
-            success: false,
-            message: "Device not connected".to_string(),
-        });
-    }
-    
-    match connection_manager.calibrate_sensor().await {
+    match connection_manager.send_command("06").await {
         Ok(response) => {
-            info!("Calibration succeeded: {}", response);
-            Json(ConnectResponse {
+            Json(CommandResponse {
                 success: true,
-                message: "IMU calibration started successfully. Keep device still during calibration.".to_string(),
+                command: "06".to_string(),
+                response: Some(response),
+                message: "Calibration command sent".to_string(),
             })
         }
         Err(e) => {
-            error!("Calibration failed: {}", e);
-            Json(ConnectResponse {
+            error!("Failed to send calibration command: {}", e);
+            Json(CommandResponse {
                 success: false,
-                message: format!("Calibration failed: {}", e),
+                command: "06".to_string(),
+                response: None,
+                message: format!("Failed to calibrate: {}", e),
             })
         }
     }
 }
 
-async fn api_set_park(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
-    info!("API: Setting park position");
+async fn api_set_park(
+    State((_device_state, connection_manager)): State<AppState>,
+) -> Json<CommandResponse> {
+    info!("Setting park position");
     
-    if !connection_manager.is_connected().await {
-        return Json(ConnectResponse {
-            success: false,
-            message: "Device not connected".to_string(),
-        });
-    }
-    
-    match connection_manager.set_park_position().await {
+    match connection_manager.send_command("04").await {
         Ok(response) => {
-            info!("Set park position succeeded: {}", response);
-            Json(ConnectResponse {
+            Json(CommandResponse {
                 success: true,
-                message: "Park position set to current telescope position successfully.".to_string(),
+                command: "04".to_string(),
+                response: Some(response),
+                message: "Set park position command sent".to_string(),
             })
         }
         Err(e) => {
-            error!("Set park position failed: {}", e);
-            Json(ConnectResponse {
+            error!("Failed to send set park command: {}", e);
+            Json(CommandResponse {
                 success: false,
+                command: "04".to_string(),
+                response: None,
                 message: format!("Failed to set park position: {}", e),
             })
         }
     }
 }
 
-async fn api_factory_reset(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
-    info!("API: Performing factory reset");
+async fn api_factory_reset(
+    State((_device_state, connection_manager)): State<AppState>,
+) -> Json<CommandResponse> {
+    info!("Performing factory reset");
     
-    if !connection_manager.is_connected().await {
-        return Json(ConnectResponse {
-            success: false,
-            message: "Device not connected".to_string(),
-        });
-    }
-    
-    match connection_manager.factory_reset().await {
+    match connection_manager.send_command("0E").await {
         Ok(response) => {
-            info!("Factory reset succeeded: {}", response);
-            Json(ConnectResponse {
+            Json(CommandResponse {
                 success: true,
-                message: "Factory reset completed successfully. Device will restart and all settings have been cleared.".to_string(),
+                command: "0E".to_string(),
+                response: Some(response),
+                message: "Factory reset command sent".to_string(),
             })
         }
         Err(e) => {
-            error!("Factory reset failed: {}", e);
-            Json(ConnectResponse {
+            error!("Failed to send factory reset command: {}", e);
+            Json(CommandResponse {
                 success: false,
-                message: format!("Factory reset failed: {}", e),
+                command: "0E".to_string(),
+                response: None,
+                message: format!("Failed to factory reset: {}", e),
             })
         }
     }
@@ -355,7 +336,7 @@ async fn management_configured_devices(Query(query): Query<AlpacaQuery>) -> Json
     device.insert("DeviceName".to_string(), serde_json::Value::String("nRF52840 Telescope Park Sensor".to_string()));
     device.insert("DeviceType".to_string(), serde_json::Value::String("SafetyMonitor".to_string()));
     device.insert("DeviceNumber".to_string(), serde_json::Value::Number(serde_json::Number::from(0)));
-    device.insert("UniqueID".to_string(), serde_json::Value::String("nrf52840-park-sensor-0".to_string()));
+    device.insert("UniqueID".to_string(), serde_json::Value::String("telescope-park-bridge-0".to_string()));
     
     Json(AlpacaResponse::success(
         vec![device],
@@ -378,12 +359,14 @@ async fn management_description(Query(query): Query<AlpacaQuery>) -> Json<Alpaca
     ))
 }
 
-// ASCOM Safety Monitor API handlers
+// ASCOM Safety Monitor API handlers - Fixed for v0.4.0
 async fn get_connected(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State((_, connection_manager)): State<AppState>,
+    State((device_state, _)): State<AppState>,
 ) -> Json<AlpacaResponse<bool>> {
+    debug!("GET Connected called for device {}", device_number);
+    
     if device_number != 0 {
         return Json(AlpacaResponse::error(
             false,
@@ -394,10 +377,44 @@ async fn get_connected(
         ));
     }
     
-    let connected = connection_manager.is_connected().await;
+    let state = device_state.read().await;
+    
+    // For ASCOM, Connected represents client connection state
     Json(AlpacaResponse::success(
-        connected,
+        state.ascom_connected,
         query.client_transaction_id.unwrap_or(0),
+        next_server_transaction_id(),
+    ))
+}
+
+// Simple PUT handler for connected property (ASCOM requirement)
+async fn put_connected_simple(
+    Path(device_number): Path<u32>,
+    State((device_state, _)): State<AppState>,
+) -> Json<AlpacaResponse<()>> {
+    debug!("PUT Connected called for device {}", device_number);
+    
+    if device_number != 0 {
+        return Json(AlpacaResponse::error(
+            (),
+            0,
+            next_server_transaction_id(),
+            0x400,
+            "Invalid device number".to_string(),
+        ));
+    }
+    
+    // Toggle ASCOM connection state (connect on first call, disconnect on second)
+    {
+        let mut state = device_state.write().await;
+        state.ascom_connected = !state.ascom_connected;
+    }
+    
+    debug!("ASCOM client connection toggled");
+    
+    Json(AlpacaResponse::success(
+        (),
+        0,
         next_server_transaction_id(),
     ))
 }
@@ -441,7 +458,7 @@ async fn get_driver_info(
     
     let device_state = device_state.read().await;
     let driver_info = format!("nRF52840 Telescope Park Bridge v{} for {}", 
-        env!("CARGO_PKG_VERSION"), 
+        env!("CARGO_PKG_VERSION"),
         device_state.device_name
     );
     
@@ -455,6 +472,7 @@ async fn get_driver_info(
 async fn get_driver_version(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
+    State(_): State<AppState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -476,6 +494,7 @@ async fn get_driver_version(
 async fn get_interface_version(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
+    State(_): State<AppState>,
 ) -> Json<AlpacaResponse<u32>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -488,7 +507,7 @@ async fn get_interface_version(
     }
     
     Json(AlpacaResponse::success(
-        1,
+        1, // Safety Monitor interface version
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -497,7 +516,7 @@ async fn get_interface_version(
 async fn get_name(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State((device_state, _)): State<AppState>,
+    State(_): State<AppState>,
 ) -> Json<AlpacaResponse<String>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -509,9 +528,8 @@ async fn get_name(
         ));
     }
     
-    let device_state = device_state.read().await;
     Json(AlpacaResponse::success(
-        device_state.device_name.clone(),
+        "nRF52840 Telescope Park Sensor".to_string(),
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -520,6 +538,7 @@ async fn get_name(
 async fn get_supported_actions(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
+    State(_): State<AppState>,
 ) -> Json<AlpacaResponse<Vec<String>>> {
     if device_number != 0 {
         return Json(AlpacaResponse::error(
@@ -532,7 +551,7 @@ async fn get_supported_actions(
     }
     
     Json(AlpacaResponse::success(
-        vec![], // No custom actions supported
+        vec!["Calibrate".to_string(), "SetPark".to_string(), "FactoryReset".to_string()],
         query.client_transaction_id.unwrap_or(0),
         next_server_transaction_id(),
     ))
@@ -553,33 +572,54 @@ async fn get_is_safe(
         ));
     }
     
-    // Check if connected
+    // If not connected, report false (not safe)
     if !connection_manager.is_connected().await {
-        return Json(AlpacaResponse::error(
+        return Json(AlpacaResponse::success(
             false,
             query.client_transaction_id.unwrap_or(0),
             next_server_transaction_id(),
-            0x407,
-            "nRF52840 device not connected".to_string(),
         ));
     }
     
-    let device_state = device_state.read().await;
-    
-    // Check if data is recent (within last 30 seconds)
-    if !device_state.is_recent(30) {
-        return Json(AlpacaResponse::error(
-            false,
-            query.client_transaction_id.unwrap_or(0),
-            next_server_transaction_id(),
-            0x408,
-            "nRF52840 device data is stale".to_string(),
-        ));
+    // Query the device for current park status
+    match connection_manager.send_command("03").await {
+        Ok(response) => {
+            // Parse JSON response to get parked status
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
+                if let Some(status) = parsed.get("status") {
+                    if status == "ok" {
+                        if let Some(data) = parsed.get("data") {
+                            if let Some(parked) = data.get("parked") {
+                                if let Some(is_parked) = parked.as_bool() {
+                                    return Json(AlpacaResponse::success(
+                                        is_parked,
+                                        query.client_transaction_id.unwrap_or(0),
+                                        next_server_transaction_id(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Fallback: check the device state
+            let device_state = device_state.read().await;
+            Json(AlpacaResponse::success(
+                device_state.is_parked,
+                query.client_transaction_id.unwrap_or(0),
+                next_server_transaction_id(),
+            ))
+        }
+        Err(e) => {
+            error!("Failed to query park status: {}", e);
+            Json(AlpacaResponse::error(
+                false,
+                query.client_transaction_id.unwrap_or(0),
+                next_server_transaction_id(),
+                0x500,
+                format!("Failed to query device: {}", e),
+            ))
+        }
     }
-    
-    Json(AlpacaResponse::success(
-        device_state.is_safe,
-        query.client_transaction_id.unwrap_or(0),
-        next_server_transaction_id(),
-    ))
 }

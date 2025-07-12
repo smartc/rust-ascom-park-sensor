@@ -18,8 +18,8 @@ use crate::connection_manager::ConnectionManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "telescope_park_bridge")]
-#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.3.1")]
-#[command(version = "0.3.1")]
+#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.4.0")]
+#[command(version = "0.4.0")]
 struct Args {
     /// Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)
     #[arg(short, long)]
@@ -56,8 +56,10 @@ async fn main() -> Result<()> {
         .with_env_filter(format!("telescope_park_bridge={}", log_level))
         .init();
     
-    info!("Starting Telescope Park Bridge v0.3.1");
-    info!("New features: Device control commands (Set Park, Calibrate, Factory Reset, Manual Commands)");
+    info!("Starting Telescope Park Bridge v0.4.0");
+    info!("FIXED: ASCOM Alpaca compliance - PUT Connected support added");
+    info!("FIXED: HTTP MethodNotAllowed errors resolved");
+    info!("NEW: Enhanced sensor communication error detection");
     info!("Target device: nRF52840 XIAO Sense with built-in IMU");
     
     // Create shared device state
@@ -83,80 +85,53 @@ async fn main() -> Result<()> {
                        desc_lower.contains("seeed") ||
                        desc_lower.contains("ch340") ||
                        desc_lower.contains("cp210") {
-                        info!("Auto-selected nRF52840-like device: {} ({})", port.name, port.description);
+                        info!("Found potential nRF52840 device: {} ({})", port.name, port.description);
                         found_port = Some(port.name.clone());
                         break;
                     }
                 }
                 
-                // If no nRF52840-like device found, use first available
-                found_port.or_else(|| {
-                    if !ports.is_empty() {
-                        info!("Auto-selected first available port: {}", ports[0].name);
-                        Some(ports[0].name.clone())
-                    } else {
-                        None
+                if found_port.is_none() {
+                    // Fallback: use first available port
+                    if let Some(first_port) = ports.first() {
+                        info!("No nRF52840-like device found, using first available: {} ({})", 
+                              first_port.name, first_port.description);
+                        found_port = Some(first_port.name.clone());
                     }
-                })
+                }
+                
+                found_port
             }
-            Err(_) => None,
+            Err(e) => {
+                error!("Failed to discover ports: {}", e);
+                None
+            }
         }
     } else {
         None
     };
     
-    // Auto-connect if we have a target port
+    // Auto-connect if port was specified or found
     if let Some(port) = target_port {
-        info!("Auto-connecting to: {}", port);
+        info!("Attempting auto-connection to {}...", port);
         match connection_manager.connect(port.clone(), args.baud).await {
-            Ok(message) => info!("Auto-connect: {}", message),
-            Err(e) => error!("Auto-connect failed: {}", e),
-        }
-    } else {
-        info!("No port specified - use web interface to select and connect");
-    }
-    
-    // Start the ASCOM Alpaca server with the connection manager
-    let server_handle = tokio::spawn(create_alpaca_server(
-        args.bind.clone(),
-        args.http_port,
-        device_state.clone(),
-        connection_manager.clone(),
-    ));
-    
-    info!("Bridge running at http://{}:{}", args.bind, args.http_port);
-    info!("Web interface: http://{}:{}/", args.bind, args.http_port);
-    info!("ASCOM Alpaca endpoint: http://{}:{}/api/v1/safetymonitor/0/", args.bind, args.http_port);
-    info!("Device control features: Set Park Position, Calibrate IMU, Factory Reset, Manual Commands");
-    
-    if connection_manager.is_connected().await {
-        if let Some(current_port) = connection_manager.get_current_port().await {
-            info!("Connected to: {}", current_port);
-        }
-    } else {
-        info!("Use the web interface to connect to your nRF52840 device");
-    }
-    
-    info!("Press Ctrl+C to stop");
-    
-    // Wait for server or Ctrl+C
-    tokio::select! {
-        result = server_handle => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
+            Ok(_) => {
+                info!("Successfully auto-connected to {}", port);
+            }
+            Err(e) => {
+                error!("Auto-connection failed: {}. Bridge will start without device connection.", e);
+                info!("Use the web interface to manually connect to your device.");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
-            
-            // Gracefully disconnect
-            if connection_manager.is_connected().await {
-                info!("Disconnecting from device...");
-                if let Err(e) = connection_manager.disconnect().await {
-                    error!("Error during shutdown disconnect: {}", e);
-                }
-            }
-        }
+    } else {
+        info!("No port specified. Use --port, --auto, or web interface to connect.");
+    }
+    
+    // Start the ASCOM Alpaca server
+    info!("Starting ASCOM Alpaca server...");
+    if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state, connection_manager).await {
+        error!("Failed to start ASCOM Alpaca server: {}", e);
+        return Err(anyhow::anyhow!("Server error: {}", e));
     }
     
     Ok(())
