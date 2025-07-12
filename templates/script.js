@@ -322,21 +322,41 @@ function updateUI(data) {
         safetyStatus.innerHTML = '🚫 Safety status unknown (disconnected)';
     }
     
-    // Device information
-    document.getElementById('device-name').textContent = data.device_name;
-    document.getElementById('device-version').textContent = data.device_version;
-    document.getElementById('manufacturer').textContent = data.manufacturer;
-    document.getElementById('platform').textContent = data.platform;
-    document.getElementById('imu').textContent = data.imu;
-    document.getElementById('serial-port').textContent = data.serial_port || 'Not connected';
+    // Device information - clear when disconnected
+    if (data.connected) {
+        document.getElementById('device-name').textContent = data.device_name;
+        document.getElementById('device-version').textContent = data.device_version;
+        document.getElementById('manufacturer').textContent = data.manufacturer;
+        document.getElementById('platform').textContent = data.platform;
+        document.getElementById('imu').textContent = data.imu;
+        document.getElementById('serial-port').textContent = data.serial_port || 'Not connected';
+    } else {
+        // Clear all device information when disconnected
+        document.getElementById('device-name').textContent = 'Not connected';
+        document.getElementById('device-version').textContent = '--';
+        document.getElementById('manufacturer').textContent = '--';
+        document.getElementById('platform').textContent = '--';
+        document.getElementById('imu').textContent = '--';
+        document.getElementById('serial-port').textContent = 'Not connected';
+    }
     
-    // Position data
-    document.getElementById('current-pitch').textContent = data.current_pitch.toFixed(2);
-    document.getElementById('current-roll').textContent = data.current_roll.toFixed(2);
-    document.getElementById('park-pitch').textContent = data.park_pitch.toFixed(2);
-    document.getElementById('park-roll').textContent = data.park_roll.toFixed(2);
-    document.getElementById('tolerance').textContent = data.position_tolerance.toFixed(1);
-    document.getElementById('calibrated').textContent = data.is_calibrated ? 'Yes' : 'No';
+    // Position data - clear when disconnected
+    if (data.connected) {
+        document.getElementById('current-pitch').textContent = data.current_pitch.toFixed(2);
+        document.getElementById('current-roll').textContent = data.current_roll.toFixed(2);
+        document.getElementById('park-pitch').textContent = data.park_pitch.toFixed(2);
+        document.getElementById('park-roll').textContent = data.park_roll.toFixed(2);
+        document.getElementById('tolerance').textContent = data.position_tolerance.toFixed(1);
+        document.getElementById('calibrated').textContent = data.is_calibrated ? 'Yes' : 'No';
+    } else {
+        // Clear all position data when disconnected
+        document.getElementById('current-pitch').textContent = '--';
+        document.getElementById('current-roll').textContent = '--';
+        document.getElementById('park-pitch').textContent = '--';
+        document.getElementById('park-roll').textContent = '--';
+        document.getElementById('tolerance').textContent = '--';
+        document.getElementById('calibrated').textContent = '--';
+    }
 }
 
 function refreshStatus() {

@@ -44,9 +44,7 @@ pub async fn run_serial_client_with_cancellation(
     
     {
         let mut state = device_state.write().await;
-        state.connected = false;
-        state.serial_port = None;
-        state.clear_error();
+        state.reset_to_disconnected();
     }
     
     info!("Serial client stopped for port: {}", port_name);
@@ -205,8 +203,7 @@ async fn connect_and_monitor_with_cancellation(
     
     {
         let mut state = device_state.write().await;
-        state.connected = false;
-        state.clear_error();
+        state.reset_to_disconnected();
     }
     
     info!("Serial port {} released and connection monitor stopped", port_name);

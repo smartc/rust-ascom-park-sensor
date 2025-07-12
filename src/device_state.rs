@@ -101,6 +101,39 @@ impl DeviceState {
         self.update_timestamp();
     }
     
+    // NEW METHOD: Reset all state to disconnected defaults
+    pub fn reset_to_disconnected(&mut self) {
+        // Connection status
+        self.connected = false;
+        self.serial_port = None;
+        self.clear_error();
+        
+        // Reset device information to disconnected state
+        self.device_name = "Not connected".to_string();
+        self.device_version = "--".to_string();
+        self.manufacturer = "--".to_string();
+        self.platform = "--".to_string();
+        self.imu = "--".to_string();
+        
+        // Reset position data
+        self.current_pitch = 0.0;
+        self.current_roll = 0.0;
+        self.park_pitch = 0.0;
+        self.park_roll = 0.0;
+        self.position_tolerance = 0.0;
+        
+        // Reset status flags
+        self.is_parked = false;
+        self.is_safe = false;
+        self.is_calibrated = false;
+        
+        // Reset system info
+        self.uptime = 0;
+        self.free_heap = 0;
+        
+        self.update_timestamp();
+    }
+    
     pub fn is_recent(&self, max_age_seconds: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
