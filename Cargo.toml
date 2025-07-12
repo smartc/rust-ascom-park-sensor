@@ -1,6 +1,6 @@
 [package]
 name = "telescope_park_bridge"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor"
 authors = ["Corey Smart"]
@@ -8,8 +8,6 @@ authors = ["Corey Smart"]
 [[bin]]
 name = "telescope_park_bridge"
 path = "src/main.rs"
-
-# Remove test_device binary since it's in src/bin/
 
 [dependencies]
 # Serial communication

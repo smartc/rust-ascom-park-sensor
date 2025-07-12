@@ -1,4 +1,4 @@
-# nRF52840 Telescope Park Bridge v0.3.0
+# nRF52840 Telescope Park Bridge v0.3.1
 
 ASCOM Alpaca bridge for nRF52840 XIAO Sense based telescope park sensor with built-in LSM6DS3TR-C IMU.
 
@@ -107,11 +107,11 @@ The nRF52840 firmware supports these hex commands:
 - Current position and park status
 - Serial port selection and connection
 
-### Device Control Tab
-- Set park position button
-- IMU calibration function
-- Factory reset with confirmation
-- Manual command interface with response display
+### Device Control Tab ⭐ NEW in v0.3.1
+- **Set Park Position**: Set current position as park position
+- **IMU Calibration**: Recalibrate the built-in sensor
+- **Factory Reset**: Reset all settings to defaults
+- **Manual Command Interface**: Send custom hex commands and view responses
 
 ### Activity Logs Tab
 - Real-time activity logging
@@ -125,10 +125,10 @@ The nRF52840 firmware supports these hex commands:
 - `GET /api/ports` - List available serial ports
 - `POST /api/connect` - Connect to serial device
 - `POST /api/disconnect` - Disconnect from device
-- `POST /api/command` - Send manual command
-- `POST /api/device/calibrate` - Calibrate IMU
-- `POST /api/device/set_park` - Set park position
-- `POST /api/device/factory_reset` - Factory reset
+- `POST /api/command` - Send manual command ⭐ NEW
+- `POST /api/device/calibrate` - Calibrate IMU ⭐ NEW
+- `POST /api/device/set_park` - Set park position ⭐ NEW
+- `POST /api/device/factory_reset` - Factory reset ⭐ NEW
 
 ### ASCOM Alpaca API
 - `GET /api/v1/safetymonitor/0/connected` - Connection status
@@ -203,6 +203,7 @@ src/
 ├── serial_client.rs     # nRF52840 communication
 ├── alpaca_server.rs     # ASCOM Alpaca API server
 ├── port_discovery.rs    # Serial port detection
+├── connection_manager.rs # Connection and command management ⭐ NEW
 └── errors.rs           # Error types
 
 templates/
@@ -212,6 +213,13 @@ templates/
 ```
 
 ## Changelog
+
+### v0.3.1 ⭐ NEW FEATURES
+- **Device Control Commands**: Set park position, calibrate IMU, factory reset
+- **Manual Command Interface**: Send custom hex commands and view responses
+- **Enhanced Connection Management**: Better command-response handling
+- **Improved Error Handling**: More detailed error messages and logging
+- **Better Web UI**: Enhanced device control tab with confirmation dialogs
 
 ### v0.3.0
 - Complete rewrite for nRF52840 XIAO Sense compatibility

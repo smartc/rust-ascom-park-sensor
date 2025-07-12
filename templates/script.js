@@ -149,7 +149,7 @@ async function setParkPosition() {
         const data = await response.json();
         
         if (data.success) {
-            log('✅ Park position set successfully');
+            log('✅ ' + data.message);
         } else {
             log('❌ Failed to set park position: ' + data.message);
         }
@@ -179,7 +179,7 @@ async function calibrateSensor() {
         const data = await response.json();
         
         if (data.success) {
-            log('✅ IMU calibration completed successfully');
+            log('✅ ' + data.message);
         } else {
             log('❌ Calibration failed: ' + data.message);
         }
@@ -213,7 +213,7 @@ async function factoryReset() {
         const data = await response.json();
         
         if (data.success) {
-            log('✅ Factory reset completed - device will restart');
+            log('✅ ' + data.message);
         } else {
             log('❌ Factory reset failed: ' + data.message);
         }
@@ -404,8 +404,9 @@ document.addEventListener('DOMContentLoaded', function() {
 setInterval(fetchStatus, 1000);
 
 // Initial load
-log('🚀 nRF52840 Telescope Park Bridge v0.3.0 loaded');
+log('🚀 nRF52840 Telescope Park Bridge v0.3.1 loaded');
 log('🔧 Target device: XIAO Sense with LSM6DS3TR-C IMU');
 log('⚡ Real-time updates: 1 second refresh rate');
+log('🎛️ Device control features: Set Park, Calibrate, Factory Reset, Manual Commands');
 fetchStatus();
 refreshPorts();

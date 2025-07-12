@@ -1,12 +1,12 @@
 // src/connection_manager.rs
 use crate::device_state::DeviceState;
-use crate::errors::Result;
+use crate::errors::{Result, BridgeError};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{info, warn, debug, error};
 
 #[derive(Debug)]
 pub struct ConnectionInfo {
@@ -14,11 +14,18 @@ pub struct ConnectionInfo {
     pub baud_rate: u32,
 }
 
+#[derive(Debug)]
+pub struct CommandRequest {
+    pub command: String,
+    pub response_sender: oneshot::Sender<Result<String>>,
+}
+
 pub struct ConnectionManager {
     device_state: Arc<RwLock<DeviceState>>,
     current_task: Arc<RwLock<Option<JoinHandle<()>>>>,
     current_cancellation: Arc<RwLock<Option<CancellationToken>>>,
     current_connection: Arc<RwLock<Option<ConnectionInfo>>>,
+    command_sender: Arc<RwLock<Option<mpsc::UnboundedSender<CommandRequest>>>>,
 }
 
 impl ConnectionManager {
@@ -28,6 +35,7 @@ impl ConnectionManager {
             current_task: Arc::new(RwLock::new(None)),
             current_cancellation: Arc::new(RwLock::new(None)),
             current_connection: Arc::new(RwLock::new(None)),
+            command_sender: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -44,18 +52,26 @@ impl ConnectionManager {
             *current_cancel = Some(cancel_token.clone());
         }
 
-        // Start new serial connection task
+        // Create command channel
+        let (cmd_sender, cmd_receiver) = mpsc::unbounded_channel::<CommandRequest>();
+        {
+            let mut current_cmd_sender = self.command_sender.write().await;
+            *current_cmd_sender = Some(cmd_sender);
+        }
+
+        // Start new serial connection task with command support
         let device_state_clone = self.device_state.clone();
         let port_clone = port.clone();
         
         let new_task = tokio::spawn(async move {
-            if let Err(e) = crate::serial_client::run_serial_client_with_cancellation(
+            if let Err(e) = crate::serial_client::run_serial_client_with_commands(
                 port_clone,
                 baud_rate,
                 device_state_clone,
                 cancel_token,
+                cmd_receiver,
             ).await {
-                tracing::error!("Serial client error: {}", e);
+                error!("Serial client error: {}", e);
             }
         });
 
@@ -97,6 +113,12 @@ impl ConnectionManager {
     }
 
     async fn disconnect_internal(&self) {
+        // Clear command sender first
+        {
+            let mut cmd_sender = self.command_sender.write().await;
+            *cmd_sender = None;
+        }
+
         // Cancel the current operation
         let cancel_token = {
             let mut current_cancel = self.current_cancellation.write().await;
@@ -131,6 +153,60 @@ impl ConnectionManager {
 
         // Give time for cleanup
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    pub async fn send_command(&self, command: &str) -> Result<String> {
+        let cmd_sender = {
+            let cmd_sender_guard = self.command_sender.read().await;
+            cmd_sender_guard.clone()
+        };
+
+        let sender = cmd_sender.ok_or_else(|| {
+            BridgeError::NotConnected
+        })?;
+
+        debug!("ConnectionManager: Sending command: {}", command);
+
+        let (response_sender, response_receiver) = oneshot::channel();
+        let cmd_request = CommandRequest {
+            command: command.to_string(),
+            response_sender,
+        };
+
+        sender.send(cmd_request).map_err(|_| {
+            BridgeError::Device("Command channel closed".to_string())
+        })?;
+
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(10), response_receiver).await {
+            Ok(Ok(result)) => {
+                debug!("ConnectionManager: Command response received");
+                result
+            }
+            Ok(Err(_)) => {
+                error!("ConnectionManager: Command response channel closed");
+                Err(BridgeError::Device("Command response channel closed".to_string()))
+            }
+            Err(_) => {
+                error!("ConnectionManager: Command timeout");
+                Err(BridgeError::Timeout)
+            }
+        }
+    }
+
+    pub async fn calibrate_sensor(&self) -> Result<String> {
+        info!("ConnectionManager: Starting sensor calibration");
+        self.send_command("06").await
+    }
+
+    pub async fn set_park_position(&self) -> Result<String> {
+        info!("ConnectionManager: Setting park position");
+        self.send_command("0D").await // Use software set park command
+    }
+
+    pub async fn factory_reset(&self) -> Result<String> {
+        info!("ConnectionManager: Performing factory reset");
+        self.send_command("0E").await
     }
 
     pub async fn is_connected(&self) -> bool {

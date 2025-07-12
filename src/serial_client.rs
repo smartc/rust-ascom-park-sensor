@@ -1,16 +1,19 @@
 // Serial client for nRF52840 device communication
+// Updated v0.3.1 with command support
 // Optimized for real-time updates with reduced debug noise:
 // - Position polling: every 1 second 
 // - Status polling: every 2 seconds
 // - Debug messages: reduced frequency to minimize log noise
 // - Park status changes: always logged as INFO level
+// - NEW: Command sending support via mpsc channel
 
 use crate::device_state::{DeviceState, FirmwareResponse, StatusResponse, PositionResponse, ParkStatusResponse};
 use crate::errors::{BridgeError, Result};
+use crate::connection_manager::CommandRequest;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::{interval, timeout};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +26,8 @@ pub async fn run_serial_client(
 ) -> Result<()> {
     // Create a cancellation token that never gets cancelled for main.rs usage
     let cancel_token = CancellationToken::new();
-    run_serial_client_with_cancellation(port_name, baud_rate, device_state, cancel_token).await
+    let (_cmd_sender, cmd_receiver) = mpsc::unbounded_channel::<CommandRequest>();
+    run_serial_client_with_commands(port_name, baud_rate, device_state, cancel_token, cmd_receiver).await
 }
 
 pub async fn run_serial_client_with_cancellation(
@@ -31,6 +35,17 @@ pub async fn run_serial_client_with_cancellation(
     baud_rate: u32,
     device_state: Arc<RwLock<DeviceState>>,
     cancel_token: CancellationToken,
+) -> Result<()> {
+    let (_cmd_sender, cmd_receiver) = mpsc::unbounded_channel::<CommandRequest>();
+    run_serial_client_with_commands(port_name, baud_rate, device_state, cancel_token, cmd_receiver).await
+}
+
+pub async fn run_serial_client_with_commands(
+    port_name: String,
+    baud_rate: u32,
+    device_state: Arc<RwLock<DeviceState>>,
+    cancel_token: CancellationToken,
+    mut cmd_receiver: mpsc::UnboundedReceiver<CommandRequest>,
 ) -> Result<()> {
     info!("Starting serial client for nRF52840 device on port: {}", port_name);
 
@@ -40,7 +55,7 @@ pub async fn run_serial_client_with_cancellation(
         state.connected = false;
     }
 
-    let result = connect_and_monitor_with_cancellation(&port_name, baud_rate, device_state.clone(), cancel_token).await;
+    let result = connect_and_monitor_with_commands(&port_name, baud_rate, device_state.clone(), cancel_token, &mut cmd_receiver).await;
     
     {
         let mut state = device_state.write().await;
@@ -51,11 +66,12 @@ pub async fn run_serial_client_with_cancellation(
     result
 }
 
-async fn connect_and_monitor_with_cancellation(
+async fn connect_and_monitor_with_commands(
     port_name: &str,
     baud_rate: u32,
     device_state: Arc<RwLock<DeviceState>>,
     cancel_token: CancellationToken,
+    cmd_receiver: &mut mpsc::UnboundedReceiver<CommandRequest>,
 ) -> Result<()> {
     info!("Connecting to nRF52840 at {} at {} baud", port_name, baud_rate);
     
@@ -139,6 +155,9 @@ async fn connect_and_monitor_with_cancellation(
         warn!("Failed to send initial status command: {}", e);
     }
     
+    // Pending command state for command-response matching
+    let mut pending_commands: Vec<(String, tokio::sync::oneshot::Sender<Result<String>>)> = Vec::new();
+    
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -146,9 +165,46 @@ async fn connect_and_monitor_with_cancellation(
                 break;
             }
             
+            // Handle incoming commands
+            cmd_request = cmd_receiver.recv() => {
+                if let Some(cmd_req) = cmd_request {
+                    info!("Processing command: {}", cmd_req.command);
+                    
+                    match send_command(&mut writer, &cmd_req.command).await {
+                        Ok(()) => {
+                            // Store the command for response matching
+                            pending_commands.push((cmd_req.command.clone(), cmd_req.response_sender));
+                            info!("Command {} sent, waiting for response", cmd_req.command);
+                        }
+                        Err(e) => {
+                            error!("Failed to send command {}: {}", cmd_req.command, e);
+                            let _ = cmd_req.response_sender.send(Err(e));
+                        }
+                    }
+                } else {
+                    // Command channel closed - this happens during shutdown
+                    debug!("Command channel closed");
+                }
+            }
+            
             result = read_response(&mut reader) => {
                 match result {
                     Ok(response) => {
+                        // Check if this response is for a pending command
+                        let mut handled_as_command = false;
+                        
+                        // Try to match response to pending commands
+                        if !pending_commands.is_empty() {
+                            // For now, we'll just match the first pending command
+                            // TODO: More sophisticated command-response matching based on response content
+                            if let Some((command, sender)) = pending_commands.pop() {
+                                info!("Command {} response: {}", command, response);
+                                let _ = sender.send(Ok(response.clone()));
+                                handled_as_command = true;
+                            }
+                        }
+                        
+                        // Always process response for state updates, even if it was for a command
                         if let Err(e) = process_response(response, device_state.clone()).await {
                             warn!("Error processing response: {}", e);
                         }
@@ -162,9 +218,24 @@ async fn connect_and_monitor_with_cancellation(
                                 debug!("No response from device (timeout) - cycle {}", TIMEOUT_COUNT);
                             }
                         }
+                        
+                        // Check for timed out commands
+                        if !pending_commands.is_empty() {
+                            debug!("Timing out {} pending commands", pending_commands.len());
+                            for (command, sender) in pending_commands.drain(..) {
+                                warn!("Command {} timed out", command);
+                                let _ = sender.send(Err(BridgeError::Timeout));
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Error reading from serial: {}", e);
+                        
+                        // Fail any pending commands
+                        for (command, sender) in pending_commands.drain(..) {
+                            error!("Command {} failed due to serial error", command);
+                            let _ = sender.send(Err(BridgeError::Device("Serial connection failed".to_string())));
+                        }
                         break;
                     }
                 }
@@ -196,6 +267,12 @@ async fn connect_and_monitor_with_cancellation(
         }
     }
     
+    // Clean up any remaining pending commands
+    for (command, sender) in pending_commands.drain(..) {
+        warn!("Cleaning up pending command: {}", command);
+        let _ = sender.send(Err(BridgeError::Device("Connection closed".to_string())));
+    }
+    
     info!("Starting serial port cleanup for {}", port_name);
     drop(reader);
     drop(writer);
@@ -213,14 +290,8 @@ async fn connect_and_monitor_with_cancellation(
 async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStream>, command: &str) -> Result<()> {
     let command_str = format!("<{}>\n", command);
     
-    // Reduce debug noise for command sending - only log every 20th command
-    static mut COMMAND_COUNT: u32 = 0;
-    unsafe {
-        COMMAND_COUNT += 1;
-        if COMMAND_COUNT % 20 == 0 {
-            debug!("Sending command to nRF52840: {} (cycle {})", command_str.trim(), COMMAND_COUNT);
-        }
-    }
+    // Log all command sends for debugging
+    debug!("Sending command to nRF52840: {}", command_str.trim());
     
     writer.write_all(command_str.as_bytes()).await?;
     writer.flush().await?;

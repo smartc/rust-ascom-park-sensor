@@ -18,8 +18,8 @@ use crate::connection_manager::ConnectionManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "telescope_park_bridge")]
-#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.3.0")]
-#[command(version = "0.3.0")]
+#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.3.1")]
+#[command(version = "0.3.1")]
 struct Args {
     /// Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)
     #[arg(short, long)]
@@ -56,7 +56,8 @@ async fn main() -> Result<()> {
         .with_env_filter(format!("telescope_park_bridge={}", log_level))
         .init();
     
-    info!("Starting Telescope Park Bridge v0.3.0");
+    info!("Starting Telescope Park Bridge v0.3.1");
+    info!("New features: Device control commands (Set Park, Calibrate, Factory Reset, Manual Commands)");
     info!("Target device: nRF52840 XIAO Sense with built-in IMU");
     
     // Create shared device state
@@ -126,6 +127,7 @@ async fn main() -> Result<()> {
     info!("Bridge running at http://{}:{}", args.bind, args.http_port);
     info!("Web interface: http://{}:{}/", args.bind, args.http_port);
     info!("ASCOM Alpaca endpoint: http://{}:{}/api/v1/safetymonitor/0/", args.bind, args.http_port);
+    info!("Device control features: Set Park Position, Calibrate IMU, Factory Reset, Manual Commands");
     
     if connection_manager.is_connected().await {
         if let Some(current_port) = connection_manager.get_current_port().await {

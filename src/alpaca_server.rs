@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn, error};
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
@@ -209,39 +209,136 @@ async fn api_disconnect(State((_, connection_manager)): State<AppState>) -> Json
     }
 }
 
-async fn api_send_command(State(_): State<AppState>, Json(request): Json<CommandRequest>) -> Json<CommandResponse> {
-    // TODO: Implement command sending through connection manager
-    // This will require extending the connection manager to support command sending
-    Json(CommandResponse {
-        success: false,
-        command: request.command,
-        response: None,
-        message: "Command sending not yet implemented - will be added in next update".to_string(),
-    })
+async fn api_send_command(
+    State((_, connection_manager)): State<AppState>, 
+    Json(request): Json<CommandRequest>
+) -> Json<CommandResponse> {
+    info!("API: Sending manual command: {}", request.command);
+    
+    if !connection_manager.is_connected().await {
+        return Json(CommandResponse {
+            success: false,
+            command: request.command,
+            response: None,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    // Validate command format (should be hex digits only)
+    let command = request.command.trim().to_uppercase();
+    if command.is_empty() || !command.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Json(CommandResponse {
+            success: false,
+            command: request.command,
+            response: None,
+            message: "Invalid command format. Use hex digits only (e.g., 01, 02, 0A050)".to_string(),
+        });
+    }
+    
+    match connection_manager.send_command(&command).await {
+        Ok(response) => {
+            info!("Command {} succeeded: {}", command, response);
+            Json(CommandResponse {
+                success: true,
+                command: command,
+                response: Some(response),
+                message: "Command sent successfully".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Command {} failed: {}", command, e);
+            Json(CommandResponse {
+                success: false,
+                command: command,
+                response: None,
+                message: format!("Command failed: {}", e),
+            })
+        }
+    }
 }
 
-async fn api_calibrate(State(_): State<AppState>) -> Json<ConnectResponse> {
-    // TODO: Send calibration command (06) through connection manager
-    Json(ConnectResponse {
-        success: false,
-        message: "Calibration command not yet implemented - will be added in next update".to_string(),
-    })
+async fn api_calibrate(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
+    info!("API: Starting sensor calibration");
+    
+    if !connection_manager.is_connected().await {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    match connection_manager.calibrate_sensor().await {
+        Ok(response) => {
+            info!("Calibration succeeded: {}", response);
+            Json(ConnectResponse {
+                success: true,
+                message: "IMU calibration started successfully. Keep device still during calibration.".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Calibration failed: {}", e);
+            Json(ConnectResponse {
+                success: false,
+                message: format!("Calibration failed: {}", e),
+            })
+        }
+    }
 }
 
-async fn api_set_park(State(_): State<AppState>) -> Json<ConnectResponse> {
-    // TODO: Send set park command (04 or 0D) through connection manager
-    Json(ConnectResponse {
-        success: false,
-        message: "Set park command not yet implemented - will be added in next update".to_string(),
-    })
+async fn api_set_park(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
+    info!("API: Setting park position");
+    
+    if !connection_manager.is_connected().await {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    match connection_manager.set_park_position().await {
+        Ok(response) => {
+            info!("Set park position succeeded: {}", response);
+            Json(ConnectResponse {
+                success: true,
+                message: "Park position set to current telescope position successfully.".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Set park position failed: {}", e);
+            Json(ConnectResponse {
+                success: false,
+                message: format!("Failed to set park position: {}", e),
+            })
+        }
+    }
 }
 
-async fn api_factory_reset(State(_): State<AppState>) -> Json<ConnectResponse> {
-    // TODO: Send factory reset command (0E) through connection manager
-    Json(ConnectResponse {
-        success: false,
-        message: "Factory reset command not yet implemented - will be added in next update".to_string(),
-    })
+async fn api_factory_reset(State((_, connection_manager)): State<AppState>) -> Json<ConnectResponse> {
+    info!("API: Performing factory reset");
+    
+    if !connection_manager.is_connected().await {
+        return Json(ConnectResponse {
+            success: false,
+            message: "Device not connected".to_string(),
+        });
+    }
+    
+    match connection_manager.factory_reset().await {
+        Ok(response) => {
+            info!("Factory reset succeeded: {}", response);
+            Json(ConnectResponse {
+                success: true,
+                message: "Factory reset completed successfully. Device will restart and all settings have been cleared.".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Factory reset failed: {}", e);
+            Json(ConnectResponse {
+                success: false,
+                message: format!("Factory reset failed: {}", e),
+            })
+        }
+    }
 }
 
 // ASCOM Management API handlers
