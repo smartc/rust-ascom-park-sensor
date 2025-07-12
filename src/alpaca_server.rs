@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");

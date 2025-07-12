@@ -177,8 +177,8 @@ impl ConnectionManager {
             BridgeError::Device("Command channel closed".to_string())
         })?;
 
-        // Wait for response with timeout
-        match tokio::time::timeout(Duration::from_secs(10), response_receiver).await {
+        // Wait for response with timeout - now waits for actual data response, not just ACK
+        match tokio::time::timeout(Duration::from_secs(15), response_receiver).await {
             Ok(Ok(result)) => {
                 debug!("ConnectionManager: Command response received");
                 result

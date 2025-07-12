@@ -30,6 +30,37 @@ function clearLog() {
     log('🔄 Log cleared');
 }
 
+// Pretty print JSON with syntax highlighting
+function formatJSON(jsonString) {
+    try {
+        const parsed = JSON.parse(jsonString);
+        return JSON.stringify(parsed, null, 2);
+    } catch (e) {
+        // If it's not valid JSON, return as-is
+        return jsonString;
+    }
+}
+
+// Add syntax highlighting to JSON
+function highlightJSON(jsonString) {
+    return jsonString
+        .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+            let cls = 'number';
+            if (/^"/.test(match)) {
+                if (/:$/.test(match)) {
+                    cls = 'key';
+                } else {
+                    cls = 'string';
+                }
+            } else if (/true|false/.test(match)) {
+                cls = 'boolean';
+            } else if (/null/.test(match)) {
+                cls = 'null';
+            }
+            return '<span class="json-' + cls + '">' + match + '</span>';
+        });
+}
+
 async function fetchStatus() {
     try {
         const response = await fetch('/api/status');
@@ -256,8 +287,13 @@ async function sendManualCommand() {
             log('✅ Command sent successfully');
             if (data.response) {
                 document.getElementById('command-response').style.display = 'block';
-                document.getElementById('response-text').textContent = data.response;
-                log('📥 Response: ' + data.response);
+                
+                // Pretty print and highlight the JSON response
+                const formattedJSON = formatJSON(data.response);
+                const highlightedJSON = highlightJSON(formattedJSON);
+                document.getElementById('response-text').innerHTML = highlightedJSON;
+                
+                log('📥 Response received (see formatted output below)');
             }
         } else {
             log('❌ Command failed: ' + data.message);
@@ -292,6 +328,21 @@ function updateConnectionButtons(connected) {
 }
 
 function updateUI(data) {
+    // Header park status (visible on all tabs)
+    const headerStatus = document.getElementById('header-park-status');
+    if (data.connected) {
+        if (data.is_parked || data.is_safe) {
+            headerStatus.className = 'header-status parked';
+            headerStatus.innerHTML = '✅ TELESCOPE PARKED';
+        } else {
+            headerStatus.className = 'header-status not-parked';
+            headerStatus.innerHTML = '⚠️ NOT PARKED';
+        }
+    } else {
+        headerStatus.className = 'header-status disconnected';
+        headerStatus.innerHTML = '🚫 DISCONNECTED';
+    }
+
     // Connection status
     const connStatus = document.getElementById('connection-status');
     if (data.connected) {

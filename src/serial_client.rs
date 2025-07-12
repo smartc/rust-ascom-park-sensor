@@ -1,11 +1,6 @@
 // Serial client for nRF52840 device communication
-// Updated v0.3.1 with command support
-// Optimized for real-time updates with reduced debug noise:
-// - Position polling: every 1 second 
-// - Status polling: every 2 seconds
-// - Debug messages: reduced frequency to minimize log noise
-// - Park status changes: always logged as INFO level
-// - NEW: Command sending support via mpsc channel
+// Fixed v0.3.1 with proper ACK + data response handling
+// The nRF52840 sends ACK first, then actual data response
 
 use crate::device_state::{DeviceState, FirmwareResponse, StatusResponse, PositionResponse, ParkStatusResponse};
 use crate::errors::{BridgeError, Result};
@@ -19,12 +14,20 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+// Enhanced pending command structure to handle ACK + data response
+#[derive(Debug)]
+struct PendingCommand {
+    command: String,
+    response_sender: tokio::sync::oneshot::Sender<Result<String>>,
+    received_ack: bool,
+    start_time: std::time::Instant,
+}
+
 pub async fn run_serial_client(
     port_name: String,
     baud_rate: u32,
     device_state: Arc<RwLock<DeviceState>>,
 ) -> Result<()> {
-    // Create a cancellation token that never gets cancelled for main.rs usage
     let cancel_token = CancellationToken::new();
     let (_cmd_sender, cmd_receiver) = mpsc::unbounded_channel::<CommandRequest>();
     run_serial_client_with_commands(port_name, baud_rate, device_state, cancel_token, cmd_receiver).await
@@ -109,7 +112,7 @@ async fn connect_and_monitor_with_commands(
     
     info!("Serial connection established to nRF52840 device");
     
-    // Read startup messages with cancellation support
+    // Read startup messages
     info!("Reading device startup messages...");
     let start_time = std::time::Instant::now();
     let mut line_buffer = String::new();
@@ -125,7 +128,7 @@ async fn connect_and_monitor_with_commands(
                     Ok(Ok(bytes_read)) => {
                         if bytes_read > 0 {
                             debug!("Device startup message received");
-                            if bytes_read > 10 { // Likely a real message
+                            if bytes_read > 10 {
                                 break;
                             }
                         }
@@ -142,11 +145,9 @@ async fn connect_and_monitor_with_commands(
         state.clear_error();
     }
     
-    // FASTER POLLING INTERVALS for more real-time updates
-    let mut status_interval = interval(Duration::from_secs(2));    // Device status every 2 seconds
-    let mut position_interval = interval(Duration::from_secs(1));  // Park position every 1 second
+    let mut status_interval = interval(Duration::from_secs(2));
+    let mut position_interval = interval(Duration::from_secs(1));
     
-    // Debug counters to reduce log noise
     let mut status_poll_count = 0u32;
     let mut position_poll_count = 0u32;
     
@@ -155,8 +156,8 @@ async fn connect_and_monitor_with_commands(
         warn!("Failed to send initial status command: {}", e);
     }
     
-    // Pending command state for command-response matching
-    let mut pending_commands: Vec<(String, tokio::sync::oneshot::Sender<Result<String>>)> = Vec::new();
+    // Enhanced pending command handling for ACK + data responses
+    let mut pending_commands: Vec<PendingCommand> = Vec::new();
     
     loop {
         tokio::select! {
@@ -165,52 +166,41 @@ async fn connect_and_monitor_with_commands(
                 break;
             }
             
-            // Handle incoming commands
             cmd_request = cmd_receiver.recv() => {
                 if let Some(cmd_req) = cmd_request {
                     info!("Processing command: {}", cmd_req.command);
                     
                     match send_command(&mut writer, &cmd_req.command).await {
                         Ok(()) => {
-                            // Store the command for response matching
-                            pending_commands.push((cmd_req.command.clone(), cmd_req.response_sender));
-                            info!("Command {} sent, waiting for response", cmd_req.command);
+                            pending_commands.push(PendingCommand {
+                                command: cmd_req.command.clone(),
+                                response_sender: cmd_req.response_sender,
+                                received_ack: false,
+                                start_time: std::time::Instant::now(),
+                            });
+                            info!("Command {} sent, waiting for ACK + data response", cmd_req.command);
                         }
                         Err(e) => {
                             error!("Failed to send command {}: {}", cmd_req.command, e);
                             let _ = cmd_req.response_sender.send(Err(e));
                         }
                     }
-                } else {
-                    // Command channel closed - this happens during shutdown
-                    debug!("Command channel closed");
                 }
             }
             
             result = read_response(&mut reader) => {
                 match result {
                     Ok(response) => {
-                        // Check if this response is for a pending command
-                        let mut handled_as_command = false;
-                        
-                        // Try to match response to pending commands
-                        if !pending_commands.is_empty() {
-                            // For now, we'll just match the first pending command
-                            // TODO: More sophisticated command-response matching based on response content
-                            if let Some((command, sender)) = pending_commands.pop() {
-                                info!("Command {} response: {}", command, response);
-                                let _ = sender.send(Ok(response.clone()));
-                                handled_as_command = true;
-                            }
-                        }
-                        
-                        // Always process response for state updates, even if it was for a command
-                        if let Err(e) = process_response(response, device_state.clone()).await {
+                        // Process response and handle command matching
+                        if let Err(e) = process_response_with_commands(
+                            response, 
+                            device_state.clone(), 
+                            &mut pending_commands
+                        ).await {
                             warn!("Error processing response: {}", e);
                         }
                     }
                     Err(BridgeError::Timeout) => {
-                        // Only log timeouts occasionally to reduce noise
                         static mut TIMEOUT_COUNT: u32 = 0;
                         unsafe {
                             TIMEOUT_COUNT += 1;
@@ -219,22 +209,29 @@ async fn connect_and_monitor_with_commands(
                             }
                         }
                         
-                        // Check for timed out commands
-                        if !pending_commands.is_empty() {
-                            debug!("Timing out {} pending commands", pending_commands.len());
-                            for (command, sender) in pending_commands.drain(..) {
-                                warn!("Command {} timed out", command);
-                                let _ = sender.send(Err(BridgeError::Timeout));
+                        // Check for timed out commands (15 second timeout)
+                        let now = std::time::Instant::now();
+                        let mut timed_out_indices = Vec::new();
+                        
+                        for (index, cmd) in pending_commands.iter().enumerate() {
+                            if now.duration_since(cmd.start_time) > Duration::from_secs(15) {
+                                timed_out_indices.push(index);
                             }
+                        }
+                        
+                        // Remove timed out commands in reverse order to maintain indices
+                        for &index in timed_out_indices.iter().rev() {
+                            let timed_out_cmd = pending_commands.remove(index);
+                            warn!("Command {} timed out after 15 seconds", timed_out_cmd.command);
+                            let _ = timed_out_cmd.response_sender.send(Err(BridgeError::Timeout));
                         }
                     }
                     Err(e) => {
                         error!("Error reading from serial: {}", e);
                         
-                        // Fail any pending commands
-                        for (command, sender) in pending_commands.drain(..) {
-                            error!("Command {} failed due to serial error", command);
-                            let _ = sender.send(Err(BridgeError::Device("Serial connection failed".to_string())));
+                        for cmd in pending_commands.drain(..) {
+                            error!("Command {} failed due to serial error", cmd.command);
+                            let _ = cmd.response_sender.send(Err(BridgeError::Device("Serial connection failed".to_string())));
                         }
                         break;
                     }
@@ -243,7 +240,6 @@ async fn connect_and_monitor_with_commands(
             
             _ = status_interval.tick() => {
                 status_poll_count += 1;
-                // Only log every 5th status poll (every 10 seconds) to reduce noise
                 if status_poll_count % 5 == 0 {
                     debug!("Polling device status (cycle {})", status_poll_count);
                 }
@@ -255,7 +251,6 @@ async fn connect_and_monitor_with_commands(
             
             _ = position_interval.tick() => {
                 position_poll_count += 1;
-                // Only log every 10th position poll (every 10 seconds) to reduce noise
                 if position_poll_count % 10 == 0 {
                     debug!("Polling park status (cycle {})", position_poll_count);
                 }
@@ -268,9 +263,9 @@ async fn connect_and_monitor_with_commands(
     }
     
     // Clean up any remaining pending commands
-    for (command, sender) in pending_commands.drain(..) {
-        warn!("Cleaning up pending command: {}", command);
-        let _ = sender.send(Err(BridgeError::Device("Connection closed".to_string())));
+    for cmd in pending_commands.drain(..) {
+        warn!("Cleaning up pending command: {}", cmd.command);
+        let _ = cmd.response_sender.send(Err(BridgeError::Device("Connection closed".to_string())));
     }
     
     info!("Starting serial port cleanup for {}", port_name);
@@ -289,8 +284,6 @@ async fn connect_and_monitor_with_commands(
 
 async fn send_command(writer: &mut tokio::io::WriteHalf<tokio_serial::SerialStream>, command: &str) -> Result<()> {
     let command_str = format!("<{}>\n", command);
-    
-    // Log all command sends for debugging
     debug!("Sending command to nRF52840: {}", command_str.trim());
     
     writer.write_all(command_str.as_bytes()).await?;
@@ -313,7 +306,6 @@ async fn read_response(reader: &mut BufReader<tokio::io::ReadHalf<tokio_serial::
             
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                // Reduce debug noise for received messages - only log every 20th response
                 static mut RECEIVE_COUNT: u32 = 0;
                 unsafe {
                     RECEIVE_COUNT += 1;
@@ -335,7 +327,12 @@ async fn read_response(reader: &mut BufReader<tokio::io::ReadHalf<tokio_serial::
     }
 }
 
-async fn process_response(response: String, device_state: Arc<RwLock<DeviceState>>) -> Result<()> {
+// Enhanced response processing with proper ACK + data command handling
+async fn process_response_with_commands(
+    response: String, 
+    device_state: Arc<RwLock<DeviceState>>,
+    pending_commands: &mut Vec<PendingCommand>
+) -> Result<()> {
     if response.is_empty() || response.starts_with("=====") || response.starts_with("Device ready") {
         return Ok(());
     }
@@ -353,35 +350,63 @@ async fn process_response(response: String, device_state: Arc<RwLock<DeviceState
         }
     };
     
-    // Reduce debug noise - only log parsed responses occasionally
     static mut RESPONSE_COUNT: u32 = 0;
     unsafe {
         RESPONSE_COUNT += 1;
         if RESPONSE_COUNT % 20 == 0 {
-            debug!("Parsed firmware response: status={}, has_data={} (cycle {})", 
-                   parsed.status, parsed.data.is_some(), RESPONSE_COUNT);
+            debug!("Parsed firmware response: status={} (cycle {})", parsed.status, RESPONSE_COUNT);
         }
     }
     
     match parsed.status.as_str() {
-        "ok" => {
-            if let Some(data) = parsed.data {
-                update_device_state_from_data(data, device_state).await?;
-            }
-        }
         "ack" => {
-            // Reduce ACK message noise - only log occasionally
-            if let Some(command) = parsed.command {
-                unsafe {
-                    if RESPONSE_COUNT % 20 == 0 {
-                        debug!("Command {} acknowledged by nRF52840 (recent acks logged)", command);
+            // Handle ACK - mark command as acknowledged but don't send response yet
+            if let Some(command) = &parsed.command {
+                for pending_cmd in pending_commands.iter_mut() {
+                    if pending_cmd.command == *command && !pending_cmd.received_ack {
+                        pending_cmd.received_ack = true;
+                        info!("Command {} acknowledged, waiting for data response", command);
+                        break;
                     }
                 }
+            }
+        }
+        "ok" => {
+            // Handle data response - send to waiting command if any
+            // Look for commands that have received ACK and are waiting for data
+            if let Some(_data) = &parsed.data {
+                let mut cmd_to_complete = None;
+                
+                for (index, pending_cmd) in pending_commands.iter().enumerate() {
+                    if pending_cmd.received_ack {
+                        // This is the data response for an acknowledged command
+                        cmd_to_complete = Some(index);
+                        break;
+                    }
+                }
+                
+                if let Some(index) = cmd_to_complete {
+                    let completed_cmd = pending_commands.remove(index);
+                    info!("Command {} completed with data response", completed_cmd.command);
+                    let _ = completed_cmd.response_sender.send(Ok(response.clone()));
+                }
+            }
+            
+            // Also process for device state updates (even if it was a command response)
+            if let Some(data) = parsed.data {
+                update_device_state_from_data(data, device_state).await?;
             }
         }
         "error" => {
             let error_msg = parsed.message.unwrap_or_else(|| "Unknown device error".to_string());
             warn!("nRF52840 reported error: {}", error_msg);
+            
+            // If there are pending commands, fail the first one
+            if !pending_commands.is_empty() {
+                let failed_cmd = pending_commands.remove(0);
+                error!("Command {} failed with device error: {}", failed_cmd.command, error_msg);
+                let _ = failed_cmd.response_sender.send(Err(BridgeError::Device(error_msg.clone())));
+            }
             
             let mut state = device_state.write().await;
             state.set_error(&error_msg);
@@ -400,12 +425,10 @@ async fn update_device_state_from_data(
 ) -> Result<()> {
     let mut state = device_state.write().await;
     
-    // Static counter to reduce debug noise
     static mut UPDATE_COUNT: u32 = 0;
     unsafe { UPDATE_COUNT += 1; }
     
     if let Ok(status_data) = serde_json::from_value::<StatusResponse>(data.clone()) {
-        // Only log status updates every 10th time (every ~20 seconds)
         unsafe {
             if UPDATE_COUNT % 10 == 0 {
                 debug!("Updating device status from nRF52840: parked={}, calibrated={} (cycle {})", 
@@ -417,7 +440,6 @@ async fn update_device_state_from_data(
     }
     
     if let Ok(position_data) = serde_json::from_value::<PositionResponse>(data.clone()) {
-        // Only log position updates every 20th time (every ~20 seconds)
         unsafe {
             if UPDATE_COUNT % 20 == 0 {
                 debug!("Updating position from nRF52840: pitch={:.2}, roll={:.2} (cycle {})", 
@@ -429,7 +451,6 @@ async fn update_device_state_from_data(
     }
     
     if let Ok(park_data) = serde_json::from_value::<ParkStatusResponse>(data.clone()) {
-        // Always log park status changes (important events), log periodic updates less frequently
         let was_parked = state.is_parked;
         let now_parked = park_data.parked;
         
@@ -458,7 +479,6 @@ async fn update_device_state_from_data(
         }
     }
     
-    // Only log unknown data occasionally
     unsafe {
         if UPDATE_COUNT % 50 == 0 {
             debug!("Unknown data format from nRF52840: {}", data);
