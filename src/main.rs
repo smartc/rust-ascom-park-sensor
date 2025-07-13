@@ -1,48 +1,45 @@
+// src/main.rs
+// Add discovery server startup
+
+mod device_state;
+mod serial_client;
+mod alpaca_server;
+mod port_discovery;
+mod connection_manager;
+mod discovery_server;  // Add this line
+mod errors;
+
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::{info, error, warn};
+use tracing_subscriber;
 
-mod serial_client;
-mod alpaca_server;
-mod device_state;
-mod errors;
-mod port_discovery;
-mod connection_manager;
+use device_state::DeviceState;
+use connection_manager::ConnectionManager;
+use alpaca_server::create_alpaca_server;
+use discovery_server::start_discovery_server;  // Add this line
 
-use crate::device_state::DeviceState;
-use crate::alpaca_server::create_alpaca_server;
-use crate::port_discovery::discover_ports;
-use crate::connection_manager::ConnectionManager;
-
-#[derive(Parser, Debug)]
-#[command(name = "telescope_park_bridge")]
-#[command(about = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor v0.4.0")]
-#[command(version = "0.4.0")]
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Args {
-    /// Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)
-    #[arg(short, long)]
+    #[arg(short, long, help = "Serial port (e.g., COM3, /dev/ttyUSB0, /dev/ttyACM0)")]
     port: Option<String>,
-    
-    /// Baud rate for serial communication
-    #[arg(short, long, default_value = "115200")]
+
+    #[arg(short, long, default_value = "115200", help = "Baud rate for serial communication")]
     baud: u32,
-    
-    /// HTTP server bind address
-    #[arg(long, default_value = "127.0.0.1")]
+
+    #[arg(long, default_value = "0.0.0.0", help = "HTTP server bind address")]
     bind: String,
-    
-    /// HTTP server port for ASCOM Alpaca
-    #[arg(long, default_value = "11111")]
+
+    #[arg(long, default_value = "11111", help = "HTTP server port for ASCOM Alpaca")]
     http_port: u16,
-    
-    /// Auto-select first available nRF52840-like device and connect
-    #[arg(long)]
+
+    #[arg(long, help = "Auto-select first available nRF52840-like device")]
     auto: bool,
-    
-    /// Enable debug logging
-    #[arg(short, long)]
+
+    #[arg(short, long, help = "Enable debug logging")]
     debug: bool,
 }
 
@@ -50,41 +47,44 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     
-    // Initialize logging
-    let log_level = if args.debug { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(format!("telescope_park_bridge={}", log_level))
-        .init();
+    // Setup logging
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(if args.debug { 
+            tracing::Level::DEBUG 
+        } else { 
+            tracing::Level::INFO 
+        })
+        .finish();
     
-    info!("Starting Telescope Park Bridge v0.4.0");
-    info!("FIXED: ASCOM Alpaca compliance - PUT Connected support added");
-    info!("FIXED: HTTP MethodNotAllowed errors resolved");
-    info!("NEW: Enhanced sensor communication error detection");
-    info!("Target device: nRF52840 XIAO Sense with built-in IMU");
+    tracing::subscriber::set_global_default(subscriber)?;
     
-    // Create shared device state
+    info!("nRF52840 Telescope Park Bridge v{} starting...", env!("CARGO_PKG_VERSION"));
+    
+    if args.debug {
+        info!("Debug logging enabled");
+    }
+    
+    // Note about UDP discovery port
+    info!("Note: Discovery requires UDP port 32227 - may need firewall exception");
+    
+    // Initialize shared state
     let device_state = Arc::new(RwLock::new(DeviceState::new()));
-    
-    // Create connection manager
     let connection_manager = Arc::new(ConnectionManager::new(device_state.clone()));
     
-    // Handle port selection and auto-connection
+    // Determine target port
     let target_port = if let Some(port) = args.port {
-        info!("Using specified port: {}", port);
         Some(port)
     } else if args.auto {
-        info!("Auto-selecting nRF52840 device...");
-        match discover_ports() {
+        match port_discovery::discover_ports() {
             Ok(ports) => {
-                // Look for nRF52840-like devices first
                 let mut found_port = None;
+                
+                // Look for nRF52840-like devices
                 for port in &ports {
-                    let desc_lower = port.description.to_lowercase();
-                    if desc_lower.contains("nrf52") || 
-                       desc_lower.contains("xiao") ||
-                       desc_lower.contains("seeed") ||
-                       desc_lower.contains("ch340") ||
-                       desc_lower.contains("cp210") {
+                    if port.description.to_lowercase().contains("usb") || 
+                       port.description.to_lowercase().contains("serial") ||
+                       port.description.to_lowercase().contains("xiao") ||
+                       port.description.to_lowercase().contains("nrf52") {
                         info!("Found potential nRF52840 device: {} ({})", port.name, port.description);
                         found_port = Some(port.name.clone());
                         break;
@@ -127,11 +127,30 @@ async fn main() -> Result<()> {
         info!("No port specified. Use --port, --auto, or web interface to connect.");
     }
     
+    // Start the discovery server
+    info!("Starting ASCOM Alpaca discovery server...");
+    let discovery_handle = tokio::spawn(async move {
+        if let Err(e) = start_discovery_server(args.http_port).await {
+            error!("Discovery server error: {}", e);
+        }
+    });
+    
     // Start the ASCOM Alpaca server
     info!("Starting ASCOM Alpaca server...");
-    if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state, connection_manager).await {
-        error!("Failed to start ASCOM Alpaca server: {}", e);
-        return Err(anyhow::anyhow!("Server error: {}", e));
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state).await {
+            error!("Failed to start ASCOM Alpaca server: {}", e);
+        }
+    });
+    
+    // Wait for either service to complete (they should run forever)
+    tokio::select! {
+        _ = discovery_handle => {
+            warn!("Discovery server terminated");
+        }
+        _ = server_handle => {
+            warn!("ASCOM Alpaca server terminated");
+        }
     }
     
     Ok(())
