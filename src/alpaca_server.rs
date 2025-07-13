@@ -427,7 +427,7 @@ async fn get_connected(
     }
     
     let device_state = state.read().await;
-    Ok(Json(AlpacaResponse::success(device_state.connected, client_transaction_id)))
+    Ok(Json(AlpacaResponse::success(device_state.ascom_connected, client_transaction_id)))
 }
 
 // PUT Connected handler with proper parameter validation

@@ -1,6 +1,6 @@
 [package]
 name = "telescope_park_bridge"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor"
 authors = ["Corey Smart"]
