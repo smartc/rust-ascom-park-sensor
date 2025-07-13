@@ -3,13 +3,13 @@
 
 use crate::device_state::DeviceState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, Extension},
     response::Html,
     routing::{get, put},
-    Router, Json, Form,
+    middleware,
+    Router, Json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -26,6 +26,13 @@ static SERVER_TRANSACTION_ID: AtomicU32 = AtomicU32::new(0);
 
 fn next_server_transaction_id() -> u32 {
     SERVER_TRANSACTION_ID.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+}
+
+// Form data structure for middleware
+#[derive(Clone)]
+struct ConnectedFormData {
+    client_transaction_id: u32,
+    connected: String,
 }
 
 // ASCOM Alpaca response structure with proper case sensitivity
@@ -114,6 +121,58 @@ struct CommandResponse {
 
 type SharedState = Arc<RwLock<DeviceState>>;
 
+// Middleware to parse form data for PUT Connected requests
+async fn parse_connected_form(
+    mut request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Only process PUT requests to connected endpoint
+    if request.method() == axum::http::Method::PUT && 
+       request.uri().path().contains("/connected") {
+        
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await;
+        let mut request = axum::http::Request::from_parts(parts, axum::body::Body::empty());
+        
+        if let Ok(body_bytes) = body {
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            
+            let mut client_transaction_id = 0u32;
+            let mut connected = String::new();
+            
+            for pair in body_str.split('&') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    match key {
+                        "ClientTransactionID" => {
+                            if let Ok(decoded) = urlencoding::decode(value) {
+                                client_transaction_id = decoded.parse().unwrap_or(0);
+                            }
+                        }
+                        "Connected" => {
+                            if let Ok(decoded) = urlencoding::decode(value) {
+                                connected = decoded.into_owned();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            
+            request.extensions_mut().insert(Some(ConnectedFormData {
+                client_transaction_id,
+                connected,
+            }));
+            
+            *request.body_mut() = axum::body::Body::from(body_bytes);
+        }
+        
+        request = axum::http::Request::from_parts(request.into_parts().0, axum::body::Body::empty());
+        }
+    }
+    
+    next.run(request).await
+}
+
 pub async fn create_alpaca_server(
     bind_address: String,
     port: u16,
@@ -133,11 +192,10 @@ fn create_router(device_state: SharedState) -> Router {
     Router::new()
         // Web interface
         .route("/", get(web_interface))
- 
+        
         // Device setup endpoints
         .route("/setup", get(web_interface))
         .route("/setup/v1/safetymonitor/:device_number/setup", get(web_interface_device_control))
-  
         
         // Web API endpoints
         .route("/api/status", get(api_status))
@@ -167,6 +225,7 @@ fn create_router(device_state: SharedState) -> Router {
         // ASCOM Device API - SafetyMonitor specific
         .route("/api/v1/safetymonitor/:device_number/issafe", get(get_is_safe))
         
+        .layer(middleware::from_fn(parse_connected_form))
         .layer(CorsLayer::permissive())
         .with_state(device_state)
 }
@@ -220,7 +279,6 @@ async fn api_connect(
     State(_state): State<SharedState>,
     Json(request): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
-    // Implementation would go here - connect to serial port
     Json(ConnectResponse {
         success: true,
         message: format!("Connecting to {}", request.port),
@@ -228,7 +286,6 @@ async fn api_connect(
 }
 
 async fn api_disconnect(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // Implementation would go here - disconnect from serial port
     Json(ConnectResponse {
         success: true,
         message: "Disconnected".to_string(),
@@ -239,7 +296,6 @@ async fn api_send_command(
     State(_state): State<SharedState>,
     Json(request): Json<CommandRequest>,
 ) -> Json<CommandResponse> {
-    // Implementation would go here - send command to device
     Json(CommandResponse {
         success: true,
         command: request.command.clone(),
@@ -249,7 +305,6 @@ async fn api_send_command(
 }
 
 async fn api_calibrate(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    // Implementation would go here - send calibrate command
     Json(CommandResponse {
         success: true,
         command: "06".to_string(),
@@ -259,7 +314,6 @@ async fn api_calibrate(State(_state): State<SharedState>) -> Json<CommandRespons
 }
 
 async fn api_set_park(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    // Implementation would go here - send set park command
     Json(CommandResponse {
         success: true,
         command: "04".to_string(),
@@ -269,7 +323,6 @@ async fn api_set_park(State(_state): State<SharedState>) -> Json<CommandResponse
 }
 
 async fn api_factory_reset(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    // Implementation would go here - send factory reset command
     Json(CommandResponse {
         success: true,
         command: "0E".to_string(),
@@ -339,28 +392,41 @@ async fn get_connected(
     Json(AlpacaResponse::success(device_state.connected, client_transaction_id))
 }
 
-// Simple PUT handler for connected property (ASCOM requirement)
+// PUT Connected handler with middleware form parsing
 async fn put_connected_simple(
     Path(device_number): Path<u32>,
+    Extension(form_data): Extension<Option<ConnectedFormData>>,
     State(state): State<SharedState>,
 ) -> Json<AlpacaResponse<()>> {
+    let client_transaction_id = form_data.as_ref().map(|d| d.client_transaction_id).unwrap_or(0);
+    
     if device_number != 0 {
         return Json(AlpacaResponse::error(
             (),
-            0,
+            client_transaction_id,
             0x400,
             "Invalid device number".to_string(),
         ));
     }
     
-    // Toggle ASCOM connection state
-    {
-        let mut device_state = state.write().await;
-        device_state.ascom_connected = !device_state.ascom_connected;
-        info!("ASCOM client connection toggled to: {}", device_state.ascom_connected);
+    if let Some(form_data) = form_data {
+        let connected_value = match form_data.connected.to_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            "" => return Json(AlpacaResponse::error((), client_transaction_id, 0x401, "Empty Connected parameter".to_string())),
+            _ => return Json(AlpacaResponse::error((), client_transaction_id, 0x401, "Invalid Connected parameter".to_string())),
+        };
+        
+        {
+            let mut device_state = state.write().await;
+            device_state.ascom_connected = connected_value;
+            info!("ASCOM client connection set to: {}", connected_value);
+        }
+    } else {
+        return Json(AlpacaResponse::error((), client_transaction_id, 0x401, "Missing Connected parameter".to_string()));
     }
     
-    Json(AlpacaResponse::success((), 0))
+    Json(AlpacaResponse::success((), client_transaction_id))
 }
 
 async fn get_description(
