@@ -277,7 +277,9 @@ fn validate_device_number(device_number: u32, client_transaction_id: u32) -> Res
 async fn web_interface() -> Html<String> {
     let html = INDEX_HTML
         .replace("{{STYLE_CSS}}", STYLE_CSS)
-        .replace("{{SCRIPT_JS}}", SCRIPT_JS);
+        .replace("{{SCRIPT_JS}}", SCRIPT_JS)
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{BUILD}}", env!("BUILD_TIMESTAMP"));
     
     Html(html)
 }
@@ -289,7 +291,9 @@ async fn web_interface_device_control(Path(device_number): Path<u32>) -> Html<St
     
     let html = INDEX_HTML
         .replace("{{STYLE_CSS}}", STYLE_CSS)
-        .replace("{{SCRIPT_JS}}", SCRIPT_JS);
+        .replace("{{SCRIPT_JS}}", SCRIPT_JS)
+        .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{BUILD}}", env!("BUILD_TIMESTAMP"));
     
     Html(html)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "telescope_park_bridge"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 description = "ASCOM Alpaca bridge for nRF52840 Telescope Park Sensor"
 authors = ["Corey Smart"]
@@ -39,6 +39,9 @@ thiserror = "1.0"
 
 # Utilities
 uuid = { version = "1.0", features = ["v4"] }
+
+[build-dependencies]
+chrono = "0.4"
 
 # For ASCOM device discovery on Windows
 [target.'cfg(windows)'.dependencies]
