@@ -5,11 +5,12 @@ use crate::device_state::DeviceState;
 use crate::connection_manager::ConnectionManager;
 use axum::{
     extract::{Path, Query, State, Extension},
-    response::{Html, Json},
+    response::{Html, Json, Response},  // Add Response
     routing::{get, put},
     middleware,
     Router,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap, HeaderValue, header},
+    body::Body,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -18,10 +19,12 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+
 // External template files
 const INDEX_HTML: &str = include_str!("../templates/index.html");
 const STYLE_CSS: &str = include_str!("../templates/style.css");
 const SCRIPT_JS: &str = include_str!("../templates/script.js");
+const ICON_PNG: &[u8] = include_bytes!("../assets/telescope-icon.png");
 
 // Global server transaction ID counter
 static SERVER_TRANSACTION_ID: AtomicU32 = AtomicU32::new(0);
@@ -209,6 +212,11 @@ fn create_router(app_state: AppState) -> Router {
     Router::new()
         // Web interface
         .route("/", get(web_interface))
+
+        // Web icon routes
+        .route("/favicon.ico", get(serve_favicon))
+        .route("/icon-192.png", get(serve_icon_192))
+        .route("/icon-512.png", get(serve_icon_512))
         
         // Device setup endpoints
         .route("/setup", get(web_interface))
@@ -754,4 +762,31 @@ async fn get_is_safe(
         is_safe,
         client_transaction_id,
     )))
+}
+
+async fn serve_favicon() -> Response<Body> {
+    Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(ICON_PNG))
+        .unwrap()
+}
+
+async fn serve_icon_192() -> Response<Body> {
+    Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(ICON_PNG))
+        .unwrap()
+}
+
+async fn serve_icon_512() -> Response<Body> {
+    Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(ICON_PNG))
+        .unwrap()
 }
