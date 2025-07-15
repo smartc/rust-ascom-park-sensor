@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     // Start the ASCOM Alpaca server
     info!("Starting ASCOM Alpaca server...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state).await {
+        if let Err(e) = create_alpaca_server(args.bind, args.http_port, device_state, connection_manager.clone()).await {
             error!("Failed to start ASCOM Alpaca server: {}", e);
         }
     });

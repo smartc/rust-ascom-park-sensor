@@ -2,6 +2,7 @@
 // Fixed version with proper ClientTransactionID handling and PUT endpoints
 
 use crate::device_state::DeviceState;
+use crate::connection_manager::ConnectionManager;
 use axum::{
     extract::{Path, Query, State, Extension},
     response::{Html, Json},
@@ -89,26 +90,6 @@ struct AlpacaQuery {
     client_id: Option<u32>,
 }
 
-// Form data for PUT requests
-#[derive(Deserialize)]
-struct ConnectedForm {
-    #[serde(rename = "Connected")]
-    #[serde(alias = "connected")]
-    connected: String,
-    
-    #[serde(rename = "ClientTransactionID")]
-    #[serde(alias = "clienttransactionid")]
-    #[serde(alias = "ClientTransactionId")]
-    #[serde(alias = "clientTransactionID")]
-    client_transaction_id: Option<u32>,
-    
-    #[serde(rename = "ClientID")]
-    #[serde(alias = "clientid")]
-    #[serde(alias = "ClientId")]
-    #[serde(alias = "clientID")]
-    client_id: Option<u32>,
-}
-
 // API request/response types
 #[derive(Deserialize)]
 struct ConnectRequest {
@@ -140,7 +121,12 @@ struct CommandResponse {
     message: String,
 }
 
-type SharedState = Arc<RwLock<DeviceState>>;
+// Updated SharedState to include ConnectionManager
+#[derive(Clone)]
+struct AppState {
+    device_state: Arc<RwLock<DeviceState>>,
+    connection_manager: Arc<ConnectionManager>,
+}
 
 // Middleware to parse form data for PUT Connected requests
 async fn parse_connected_form(
@@ -201,9 +187,15 @@ async fn parse_connected_form(
 pub async fn create_alpaca_server(
     bind_address: String,
     port: u16,
-    device_state: SharedState,
+    device_state: Arc<RwLock<DeviceState>>,
+    connection_manager: Arc<ConnectionManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = create_router(device_state);
+    let app_state = AppState {
+        device_state,
+        connection_manager,
+    };
+    
+    let app = create_router(app_state);
     
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_address, port)).await?;
     
@@ -213,7 +205,7 @@ pub async fn create_alpaca_server(
     Ok(())
 }
 
-fn create_router(device_state: SharedState) -> Router {
+fn create_router(app_state: AppState) -> Router {
     Router::new()
         // Web interface
         .route("/", get(web_interface))
@@ -225,12 +217,12 @@ fn create_router(device_state: SharedState) -> Router {
         // Web API endpoints
         .route("/api/status", get(api_status))
         .route("/api/ports", get(api_ports))
-        .route("/api/connect", put(api_connect))
-        .route("/api/disconnect", put(api_disconnect))
-        .route("/api/command", put(api_send_command))
-        .route("/api/device/calibrate", put(api_calibrate))
-        .route("/api/device/set_park", put(api_set_park))
-        .route("/api/device/factory_reset", put(api_factory_reset))
+        .route("/api/connect", axum::routing::post(api_connect))
+        .route("/api/disconnect", axum::routing::post(api_disconnect))
+        .route("/api/command", axum::routing::post(api_send_command))
+        .route("/api/device/calibrate", axum::routing::post(api_calibrate))
+        .route("/api/device/set_park", axum::routing::post(api_set_park))
+        .route("/api/device/factory_reset", axum::routing::post(api_factory_reset))
         
         // ASCOM Management API
         .route("/management/apiversions", get(get_management_api_versions))
@@ -252,25 +244,12 @@ fn create_router(device_state: SharedState) -> Router {
         
         .layer(middleware::from_fn(parse_connected_form))
         .layer(CorsLayer::permissive())
-        .with_state(device_state)
+        .with_state(app_state)
 }
 
 // Helper function to extract client transaction ID with proper default handling
 fn get_client_transaction_id(query_id: Option<u32>) -> u32 {
     query_id.unwrap_or(0)
-}
-
-// Validation function for device number
-fn validate_device_number(device_number: u32, client_transaction_id: u32) -> Result<(), Json<AlpacaResponse<serde_json::Value>>> {
-    if device_number != 0 {
-        return Err(Json(AlpacaResponse::error(
-            serde_json::Value::Null,
-            client_transaction_id,
-            1024, // ASCOM error code for invalid device number
-            format!("Invalid device number: {}", device_number),
-        )));
-    }
-    Ok(())
 }
 
 // Web interface handlers
@@ -298,9 +277,9 @@ async fn web_interface_device_control(Path(device_number): Path<u32>) -> Html<St
     Html(html)
 }
 
-// API handlers for web interface
-async fn api_status(State(state): State<SharedState>) -> Json<DeviceState> {
-    let device_state = state.read().await;
+// API handlers for web interface - UNSTUBBED to use ConnectionManager
+async fn api_status(State(state): State<AppState>) -> Json<DeviceState> {
+    let device_state = state.device_state.read().await;
     Json(device_state.clone())
 }
 
@@ -312,62 +291,147 @@ async fn api_ports() -> Json<PortListResponse> {
 }
 
 async fn api_connect(
-    State(_state): State<SharedState>,
+    State(state): State<AppState>,
     Json(request): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
-    // Implementation depends on your serial connection logic
-    Json(ConnectResponse {
-        success: true,
-        message: format!("Connecting to {}", request.port),
-    })
+    let baud_rate = request.baud_rate.unwrap_or(115200);
+    
+    match state.connection_manager.connect(request.port.clone(), baud_rate).await {
+        Ok(message) => {
+            info!("Connection successful: {}", message);
+            Json(ConnectResponse {
+                success: true,
+                message,
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to connect: {}", e);
+            info!("Connection failed: {}", error_msg);
+            Json(ConnectResponse {
+                success: false,
+                message: error_msg,
+            })
+        }
+    }
 }
 
-async fn api_disconnect(State(_state): State<SharedState>) -> Json<ConnectResponse> {
-    // Implementation depends on your serial connection logic
-    Json(ConnectResponse {
-        success: true,
-        message: "Disconnected".to_string(),
-    })
+async fn api_disconnect(State(state): State<AppState>) -> Json<ConnectResponse> {
+    match state.connection_manager.disconnect().await {
+        Ok(message) => {
+            info!("Disconnection successful: {}", message);
+            Json(ConnectResponse {
+                success: true,
+                message,
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to disconnect: {}", e);
+            info!("Disconnection failed: {}", error_msg);
+            Json(ConnectResponse {
+                success: false,
+                message: error_msg,
+            })
+        }
+    }
 }
 
 async fn api_send_command(
-    State(_state): State<SharedState>,
+    State(state): State<AppState>,
     Json(request): Json<CommandRequest>,
 ) -> Json<CommandResponse> {
-    // Implementation depends on your command sending logic
-    Json(CommandResponse {
-        success: true,
-        command: request.command,
-        response: Some("OK".to_string()),
-        message: "Command sent".to_string(),
-    })
+    match state.connection_manager.send_command(&request.command).await {
+        Ok(response) => {
+            info!("Command '{}' executed successfully", request.command);
+            Json(CommandResponse {
+                success: true,
+                command: request.command,
+                response: Some(response),
+                message: "Command executed successfully".to_string(),
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Command failed: {}", e);
+            info!("Command '{}' failed: {}", request.command, error_msg);
+            Json(CommandResponse {
+                success: false,
+                command: request.command,
+                response: None,
+                message: error_msg,
+            })
+        }
+    }
 }
 
-async fn api_calibrate(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    Json(CommandResponse {
-        success: true,
-        command: "CALIBRATE".to_string(),
-        response: Some("OK".to_string()),
-        message: "Calibration initiated".to_string(),
-    })
+async fn api_calibrate(State(state): State<AppState>) -> Json<CommandResponse> {
+    match state.connection_manager.calibrate_sensor().await {
+        Ok(response) => {
+            info!("Sensor calibration completed successfully");
+            Json(CommandResponse {
+                success: true,
+                command: "06".to_string(),
+                response: Some(response),
+                message: "Sensor calibration completed".to_string(),
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Calibration failed: {}", e);
+            info!("Sensor calibration failed: {}", error_msg);
+            Json(CommandResponse {
+                success: false,
+                command: "06".to_string(),
+                response: None,
+                message: error_msg,
+            })
+        }
+    }
 }
 
-async fn api_set_park(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    Json(CommandResponse {
-        success: true,
-        command: "SET_PARK".to_string(),
-        response: Some("OK".to_string()),
-        message: "Park position set".to_string(),
-    })
+async fn api_set_park(State(state): State<AppState>) -> Json<CommandResponse> {
+    match state.connection_manager.set_park_position().await {
+        Ok(response) => {
+            info!("Park position set successfully");
+            Json(CommandResponse {
+                success: true,
+                command: "0D".to_string(),
+                response: Some(response),
+                message: "Park position set successfully".to_string(),
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Set park failed: {}", e);
+            info!("Set park position failed: {}", error_msg);
+            Json(CommandResponse {
+                success: false,
+                command: "0D".to_string(),
+                response: None,
+                message: error_msg,
+            })
+        }
+    }
 }
 
-async fn api_factory_reset(State(_state): State<SharedState>) -> Json<CommandResponse> {
-    Json(CommandResponse {
-        success: true,
-        command: "FACTORY_RESET".to_string(),
-        response: Some("OK".to_string()),
-        message: "Factory reset initiated".to_string(),
-    })
+async fn api_factory_reset(State(state): State<AppState>) -> Json<CommandResponse> {
+    match state.connection_manager.factory_reset().await {
+        Ok(response) => {
+            info!("Factory reset completed successfully");
+            Json(CommandResponse {
+                success: true,
+                command: "0E".to_string(),
+                response: Some(response),
+                message: "Factory reset completed".to_string(),
+            })
+        }
+        Err(e) => {
+            let error_msg = format!("Factory reset failed: {}", e);
+            info!("Factory reset failed: {}", error_msg);
+            Json(CommandResponse {
+                success: false,
+                command: "0E".to_string(),
+                response: None,
+                message: error_msg,
+            })
+        }
+    }
 }
 
 // ASCOM Management API handlers
@@ -394,9 +458,9 @@ async fn get_management_description(Query(query): Query<AlpacaQuery>) -> Json<Al
 
 async fn get_configured_devices(
     Query(query): Query<AlpacaQuery>, 
-    State(state): State<SharedState>
+    State(state): State<AppState>
 ) -> Json<AlpacaResponse<Vec<serde_json::Value>>> {
-    let device_state = state.read().await;
+    let device_state = state.device_state.read().await;
     let devices = vec![serde_json::json!({
         "DeviceName": device_state.device_name,
         "DeviceType": "SafetyMonitor", 
@@ -414,7 +478,7 @@ async fn get_configured_devices(
 async fn get_connected(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State(state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<bool>>, (StatusCode, Json<AlpacaResponse<bool>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -430,7 +494,7 @@ async fn get_connected(
         ));
     }
     
-    let device_state = state.read().await;
+    let device_state = state.device_state.read().await;
     Ok(Json(AlpacaResponse::success(device_state.ascom_connected, client_transaction_id)))
 }
 
@@ -438,7 +502,7 @@ async fn get_connected(
 async fn put_connected(
     Path(device_number): Path<u32>,
     Extension(form_data): Extension<Option<ConnectedFormData>>,
-    State(state): State<SharedState>,
+    State(state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<()>>, (StatusCode, Json<AlpacaResponse<()>>)> {
     let client_transaction_id = form_data.as_ref().map(|d| d.client_transaction_id).unwrap_or(0);
     
@@ -501,7 +565,7 @@ async fn put_connected(
     
     // Update device state
     {
-        let mut device_state = state.write().await;
+        let mut device_state = state.device_state.write().await;
         device_state.ascom_connected = connected_value;
         info!("ASCOM Connected set to: {}", connected_value);
     }
@@ -512,7 +576,7 @@ async fn put_connected(
 async fn get_description(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(_state): State<SharedState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<String>>, (StatusCode, Json<AlpacaResponse<String>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -529,7 +593,7 @@ async fn get_description(
     }
     
     Ok(Json(AlpacaResponse::success(
-        "nRF52840 Based Custom Position Sensor for Telescope Park Detection".to_string(),
+        "nRF52840 based telescope park position sensor for ASCOM safety monitoring".to_string(),
         client_transaction_id,
     )))
 }
@@ -537,7 +601,7 @@ async fn get_description(
 async fn get_driver_info(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State(state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<String>>, (StatusCode, Json<AlpacaResponse<String>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -553,19 +617,20 @@ async fn get_driver_info(
         ));
     }
     
-    let device_state = state.read().await;
-    let driver_info = format!("Telescope Park Bridge v{} for {}", 
-        env!("CARGO_PKG_VERSION"), 
-        device_state.device_name
-    );
+    let device_state = state.device_state.read().await;
+    let driver_info = format!("nRF52840 Telescope Park Bridge v{} for {}", 
+        env!("CARGO_PKG_VERSION"), device_state.device_name);
     
-    Ok(Json(AlpacaResponse::success(driver_info, client_transaction_id)))
+    Ok(Json(AlpacaResponse::success(
+        driver_info,
+        client_transaction_id,
+    )))
 }
 
 async fn get_driver_version(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(_state): State<SharedState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<String>>, (StatusCode, Json<AlpacaResponse<String>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -590,7 +655,7 @@ async fn get_driver_version(
 async fn get_interface_version(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(_state): State<SharedState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<u32>>, (StatusCode, Json<AlpacaResponse<u32>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -612,7 +677,7 @@ async fn get_interface_version(
 async fn get_name(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State(state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<String>>, (StatusCode, Json<AlpacaResponse<String>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -628,14 +693,17 @@ async fn get_name(
         ));
     }
     
-    let device_state = state.read().await;
-    Ok(Json(AlpacaResponse::success(device_state.device_name.clone(), client_transaction_id)))
+    let device_state = state.device_state.read().await;
+    Ok(Json(AlpacaResponse::success(
+        device_state.device_name.clone(),
+        client_transaction_id,
+    )))
 }
 
 async fn get_supported_actions(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(_state): State<SharedState>,
+    State(_state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<Vec<String>>>, (StatusCode, Json<AlpacaResponse<Vec<String>>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -651,16 +719,13 @@ async fn get_supported_actions(
         ));
     }
     
-    Ok(Json(AlpacaResponse::success(
-        vec![], // No custom actions supported
-        client_transaction_id,
-    )))
+    Ok(Json(AlpacaResponse::success(vec![], client_transaction_id)))
 }
 
 async fn get_is_safe(
     Path(device_number): Path<u32>,
     Query(query): Query<AlpacaQuery>,
-    State(state): State<SharedState>,
+    State(state): State<AppState>,
 ) -> Result<Json<AlpacaResponse<bool>>, (StatusCode, Json<AlpacaResponse<bool>>)> {
     let client_transaction_id = get_client_transaction_id(query.client_transaction_id);
     
@@ -676,33 +741,17 @@ async fn get_is_safe(
         ));
     }
     
-    let device_state = state.read().await;
+    let device_state = state.device_state.read().await;
     
-    // If not connected, it's not safe
-    if !device_state.connected {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(AlpacaResponse::error(
-                false,
-                client_transaction_id,
-                1032, // ASCOM error code for not connected
-                "Device not connected".to_string(),
-            ))
-        ));
-    }
+    // ASCOM compliance: IsSafe should return false if not connected
+    let is_safe = if device_state.connected {
+        device_state.is_safe
+    } else {
+        false
+    };
     
-    // Check if data is recent (within last 30 seconds)
-    if !device_state.is_recent(30) {
-        return Err((
-            StatusCode::REQUEST_TIMEOUT,
-            Json(AlpacaResponse::error(
-                false,
-                client_transaction_id,
-                1033, // ASCOM error code for timeout
-                "Device data is stale".to_string(),
-            ))
-        ));
-    }
-    
-    Ok(Json(AlpacaResponse::success(device_state.is_safe, client_transaction_id)))
+    Ok(Json(AlpacaResponse::success(
+        is_safe,
+        client_transaction_id,
+    )))
 }

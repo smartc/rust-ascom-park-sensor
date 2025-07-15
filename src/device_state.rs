@@ -1,5 +1,5 @@
 // src/device_state.rs
-// Fixed version with proper nRF52840 response parsing and state management
+// Fixed version with backward compatible nRF52840 response parsing
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,16 +57,30 @@ pub struct FirmwareResponse {
     pub message: Option<String>,
 }
 
+// Backward compatible StatusResponse - handles both old and new firmware formats
 #[derive(Debug, Deserialize)]
 pub struct StatusResponse {
+    // Device info (from old firmware format)
+    #[serde(rename = "deviceName")]
+    pub device_name: Option<String>,
+    pub version: Option<String>,
+    pub manufacturer: Option<String>,
+    pub platform: Option<String>,
+    pub imu: Option<String>,
+    #[serde(rename = "ledStatus")]
+    pub led_status: Option<bool>,
+    
+    // Status (common to both formats)
     pub parked: bool,
     pub calibrated: bool,
-    #[serde(rename = "parkPitch")]
-    pub park_pitch: f32,
-    #[serde(rename = "parkRoll")]
-    pub park_roll: f32,
-    pub tolerance: f32,
     pub uptime: Option<u64>,
+    
+    // Position info (from new firmware format)
+    #[serde(rename = "parkPitch")]
+    pub park_pitch: Option<f32>,
+    #[serde(rename = "parkRoll")]
+    pub park_roll: Option<f32>,
+    pub tolerance: Option<f32>,
     #[serde(rename = "freeHeap")]
     pub free_heap: Option<u64>,
 }
@@ -167,14 +181,13 @@ impl DeviceState {
             .as_secs();
     }
     
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+    }
+    
     pub fn set_error(&mut self, error: &str) {
         self.error_message = Some(error.to_string());
         self.connected = false;
-        self.update_timestamp();
-    }
-    
-    pub fn clear_error(&mut self) {
-        self.error_message = None;
         self.update_timestamp();
     }
     
@@ -194,23 +207,48 @@ impl DeviceState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
         now.saturating_sub(self.last_update) <= max_age_seconds
     }
     
-    // Update methods for different firmware response types
+    // Backward compatible update method - handles both old and new firmware formats
     pub fn update_from_status(&mut self, status: &StatusResponse) {
+        // Update device information if present (old firmware format)
+        if let Some(ref name) = status.device_name {
+            self.device_name = name.clone();
+        }
+        if let Some(ref version) = status.version {
+            self.device_version = version.clone();
+        }
+        if let Some(ref manufacturer) = status.manufacturer {
+            self.manufacturer = manufacturer.clone();
+        }
+        if let Some(ref platform) = status.platform {
+            self.platform = platform.clone();
+        }
+        if let Some(ref imu) = status.imu {
+            self.imu = imu.clone();
+        }
+        
+        // Update park position if present (new firmware format)
+        if let Some(park_pitch) = status.park_pitch {
+            self.park_pitch = park_pitch;
+        }
+        if let Some(park_roll) = status.park_roll {
+            self.park_roll = park_roll;
+        }
+        if let Some(tolerance) = status.tolerance {
+            self.position_tolerance = tolerance;
+        }
+        
+        // Update status (common to both formats)
         self.is_parked = status.parked;
         self.is_safe = status.parked; // ASCOM Safety Monitor compatibility
         self.is_calibrated = status.calibrated;
-        self.park_pitch = status.park_pitch;
-        self.park_roll = status.park_roll;
-        self.position_tolerance = status.tolerance;
         
+        // Update system info if present
         if let Some(uptime) = status.uptime {
             self.uptime = uptime;
         }
-        
         if let Some(free_heap) = status.free_heap {
             self.free_heap = free_heap;
         }
